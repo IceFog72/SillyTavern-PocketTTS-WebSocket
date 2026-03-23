@@ -1,5 +1,5 @@
 // pocket-tts.js — SillyTavern TTS Provider for pocket-tts-openapi
-// WebSocket-only audio generation. All audio goes through WS.
+// Persistent WebSocket connection with request queue. All audio goes through WS.
 
 import { saveTtsProviderSettings, getPreviewString } from '../../tts/index.js';
 
@@ -13,14 +13,18 @@ class PocketTtsProvider {
 
     audioElement = document.createElement('audio');
 
+    // Persistent WS state
     _ws = null;
-    _wsReconnectTimer = null;
+    _wsReady = false;
+    _wsQueue = [];       // pending requests: [{text, voice, resolve, reject, timeout}]
+    _wsCurrent = null;   // currently processing request
+    _wsChunks = [];      // binary chunks for current request
 
     static MODEL_OPTIONS = [
-        { value: 'tts-1',          label: 'tts-1 (Fast CPU)' },
-        { value: 'tts-1-hd',       label: 'tts-1-hd (Quality CPU)' },
-        { value: 'tts-1-cuda',     label: 'tts-1-cuda (Fast GPU)' },
-        { value: 'tts-1-hd-cuda',  label: 'tts-1-hd-cuda (Quality GPU)' },
+        { value: 'tts-1', label: 'tts-1 (Fast CPU)' },
+        { value: 'tts-1-hd', label: 'tts-1-hd (Quality CPU)' },
+        { value: 'tts-1-cuda', label: 'tts-1-cuda (Fast GPU)' },
+        { value: 'tts-1-hd-cuda', label: 'tts-1-hd-cuda (Quality GPU)' },
     ];
 
     defaultSettings = {
@@ -86,8 +90,10 @@ class PocketTtsProvider {
     _updateStatus(connected) {
         const el = document.getElementById('ptts_status');
         if (!el) return;
+        const qLen = this._wsQueue.length;
+        const qInfo = qLen > 0 ? ` (queue: ${qLen})` : '';
         el.innerHTML = connected
-            ? '<span style="color:#4caf50;">●</span> Connected'
+            ? '<span style="color:#4caf50;">●</span> Connected' + qInfo
             : '<span style="color:#f44336;">●</span> Disconnected';
     }
 
@@ -109,6 +115,8 @@ class PocketTtsProvider {
     // ─── Settings Load / Change ─────────────────────────────────────
 
     onSettingsChange() {
+        const oldEndpoint = this.settings.provider_endpoint;
+
         this.settings.provider_endpoint = String($('#ptts_endpoint').val());
         this.settings.model = String($('#ptts_model').val());
         this.settings.format = String($('#ptts_format').val());
@@ -120,8 +128,10 @@ class PocketTtsProvider {
         $('#ptts_temperature_val').text(this.settings.temperature);
         $('#ptts_top_p_val').text(this.settings.top_p);
 
-        this._disconnectWs();
-        this.checkReady().then(() => this._updateStatus(this.ready));
+        if (this.settings.provider_endpoint !== oldEndpoint) {
+            this._disconnectWs();
+            this.checkReady().then(() => this._updateStatus(this.ready));
+        }
         saveTtsProviderSettings();
     }
 
@@ -200,7 +210,6 @@ class PocketTtsProvider {
             }
         } catch { /* server unavailable */ }
 
-        // Fallback: all built-in voices
         this.voices = [
             'nova', 'alloy', 'echo', 'fable', 'onyx', 'shimmer',
             'alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma',
@@ -226,69 +235,102 @@ class PocketTtsProvider {
         return this.voices;
     }
 
-    // ─── TTS Generation (WebSocket) ────────────────────────────────
+    // ─── TTS Generation (Persistent WS) ────────────────────────────
 
     async generateTts(text, voiceId) {
-        console.debug('PocketTTS: WS generate, voice="' + voiceId + '", ' + text.length + ' chars');
-        return this._generateViaWs(text, voiceId);
+        console.debug('PocketTTS: generate, voice="' + voiceId + '", ' + text.length + ' chars');
+        return new Promise((resolve, reject) => {
+            const req = { text, voice: voiceId, resolve, reject };
+            req.timeout = setTimeout(() => {
+                const idx = this._wsQueue.indexOf(req);
+                if (idx >= 0) this._wsQueue.splice(idx, 1);
+                if (this._wsCurrent === req) this._wsCurrent = null;
+                reject(new Error('TTS request timeout (120s)'));
+                this._updateStatus(this.ready);
+            }, 120000);
+
+            this._wsQueue.push(req);
+            this._updateStatus(this.ready);
+            this._processQueue();
+        });
     }
 
-    async _generateViaWs(text, voiceId) {
-        const ws = await this._connectWs();
+    async _processQueue() {
+        // Already processing a request
+        if (this._wsCurrent) return;
+        // Queue empty
+        if (this._wsQueue.length === 0) return;
 
-        return new Promise((resolve, reject) => {
-            const chunks = [];
-            let settled = false;
+        this._wsCurrent = this._wsQueue.shift();
+        this._updateStatus(this.ready);
 
-            const onMsg = (event) => {
-                if (event.data instanceof ArrayBuffer) {
-                    chunks.push(new Uint8Array(event.data));
-                } else {
-                    try {
-                        const msg = JSON.parse(event.data);
-                        if (msg.status === 'done') {
-                            finish();
-                            const totalLen = chunks.reduce((s, c) => s + c.length, 0);
-                            const combined = new Uint8Array(totalLen);
-                            let off = 0;
-                            for (const ch of chunks) { combined.set(ch, off); off += ch.length; }
-                            const blob = new Blob([combined], { type: this._getMimeType() });
-                            resolve(new Response(blob, { headers: { 'Content-Type': blob.type } }));
-                        } else if (msg.status === 'error') {
-                            finish();
-                            reject(new Error(msg.error || 'WebSocket TTS error'));
-                        }
-                    } catch { /* ignore stray text frames */ }
-                }
-            };
-
-            const onErr = () => { finish(); reject(new Error('WebSocket error')); };
-            const onClose = () => { if (!settled) { finish(); reject(new Error('WebSocket closed')); } };
-
-            const timeout = setTimeout(() => { if (!settled) { finish(); reject(new Error('WebSocket TTS timeout (120s)')); } }, 120000);
-
-            function finish() {
-                settled = true;
-                clearTimeout(timeout);
-                ws.removeEventListener('message', onMsg);
-                ws.removeEventListener('error', onErr);
-                ws.removeEventListener('close', onClose);
-            }
-
-            ws.addEventListener('message', onMsg);
-            ws.addEventListener('error', onErr);
-            ws.addEventListener('close', onClose);
+        try {
+            const ws = await this._ensureWs();
+            this._wsChunks = [];
 
             ws.send(JSON.stringify({
-                text: text,
-                voice: voiceId,
+                text: this._wsCurrent.text,
+                voice: this._wsCurrent.voice,
                 format: this.settings.format,
                 speed: this.settings.speed,
                 temperature: this.settings.temperature,
                 top_p: this.settings.top_p,
                 model: this.settings.model,
             }));
-        });
+        } catch (err) {
+            clearTimeout(this._wsCurrent.timeout);
+            this._wsCurrent.reject(err);
+            this._wsCurrent = null;
+            this._updateStatus(this.ready);
+            this._processQueue();
+        }
+    }
+
+    _onWsMessage(event) {
+        if (!this._wsCurrent) return;
+
+        if (event.data instanceof ArrayBuffer) {
+            this._wsChunks.push(new Uint8Array(event.data));
+            return;
+        }
+
+        try {
+            const msg = JSON.parse(event.data);
+            if (msg.status === 'done') {
+                clearTimeout(this._wsCurrent.timeout);
+                const totalLen = this._wsChunks.reduce((s, c) => s + c.length, 0);
+                const combined = new Uint8Array(totalLen);
+                let off = 0;
+                for (const ch of this._wsChunks) { combined.set(ch, off); off += ch.length; }
+                const blob = new Blob([combined], { type: this._getMimeType() });
+                const resp = new Response(blob, { headers: { 'Content-Type': blob.type } });
+                this._wsCurrent.resolve(resp);
+                this._wsCurrent = null;
+                this._updateStatus(this.ready);
+                this._processQueue();
+            } else if (msg.status === 'error') {
+                clearTimeout(this._wsCurrent.timeout);
+                this._wsCurrent.reject(new Error(msg.error || 'WebSocket TTS error'));
+                this._wsCurrent = null;
+                this._updateStatus(this.ready);
+                this._processQueue();
+            }
+        } catch { /* ignore non-JSON text frames */ }
+    }
+
+    _onWsClose() {
+        this._wsReady = false;
+        if (this._wsCurrent) {
+            clearTimeout(this._wsCurrent.timeout);
+            this._wsCurrent.reject(new Error('WebSocket closed'));
+            this._wsCurrent = null;
+        }
+        this._updateStatus(false);
+
+        // Retry queue items if any remain
+        if (this._wsQueue.length > 0) {
+            setTimeout(() => this._processQueue(), 1000);
+        }
     }
 
     // ─── Preview ───────────────────────────────────────────────────
@@ -300,7 +342,7 @@ class PocketTtsProvider {
         const text = getPreviewString('en-US');
 
         try {
-            const response = await this._generateViaWs(text, voiceId);
+            const response = await this.generateTts(text, voiceId);
             const blob = await response.blob();
             const url = URL.createObjectURL(blob);
             this.audioElement.src = url;
@@ -311,7 +353,7 @@ class PocketTtsProvider {
         }
     }
 
-    // ─── WebSocket Connection ──────────────────────────────────────
+    // ─── Persistent WebSocket Connection ───────────────────────────
 
     _getWsUrl(path) {
         let ep = this.settings.provider_endpoint.replace(/\/$/, '');
@@ -321,8 +363,10 @@ class PocketTtsProvider {
         return ep + (path || '/v1/audio/stream');
     }
 
-    async _connectWs() {
-        if (this._ws && this._ws.readyState === WebSocket.OPEN) return this._ws;
+    async _ensureWs() {
+        if (this._ws && this._ws.readyState === WebSocket.OPEN && this._wsReady) {
+            return this._ws;
+        }
         this._disconnectWs();
 
         return new Promise((resolve, reject) => {
@@ -339,8 +383,14 @@ class PocketTtsProvider {
             const onOpen = () => {
                 clearTimeout(timer);
                 ws.removeEventListener('error', onErr);
-                console.debug('PocketTTS: WebSocket connected');
+                console.debug('PocketTTS: WebSocket connected (persistent)');
                 this._ws = ws;
+                this._wsReady = true;
+                ws.addEventListener('message', (e) => this._onWsMessage(e));
+                ws.addEventListener('close', () => this._onWsClose());
+                ws.addEventListener('error', () => {
+                    console.error('PocketTTS: WebSocket error during operation');
+                });
                 resolve(ws);
             };
 
@@ -357,13 +407,10 @@ class PocketTtsProvider {
     }
 
     _disconnectWs() {
+        this._wsReady = false;
         if (this._ws) {
             try { this._ws.close(); } catch { /* */ }
             this._ws = null;
-        }
-        if (this._wsReconnectTimer) {
-            clearTimeout(this._wsReconnectTimer);
-            this._wsReconnectTimer = null;
         }
     }
 
@@ -380,6 +427,17 @@ class PocketTtsProvider {
     // ─── Cleanup ───────────────────────────────────────────────────
 
     dispose() {
+        // Reject all queued requests
+        for (const req of this._wsQueue) {
+            clearTimeout(req.timeout);
+            req.reject(new Error('Provider disposed'));
+        }
+        this._wsQueue = [];
+        if (this._wsCurrent) {
+            clearTimeout(this._wsCurrent.timeout);
+            this._wsCurrent.reject(new Error('Provider disposed'));
+            this._wsCurrent = null;
+        }
         this._disconnectWs();
     }
 }

@@ -1,6 +1,5 @@
 import { describe, test, expect, beforeEach, jest } from '@jest/globals';
 
-// Mock the TTS module — must be before import
 const mockTts = {
     saveTtsProviderSettings: () => {},
     getPreviewString: () => 'The quick brown fox jumps over the lazy dog',
@@ -9,6 +8,17 @@ jest.unstable_mockModule(
     '/home/icefog/LLM/SillyTavern-Launcher/SillyTavern/public/scripts/extensions/tts/index.js',
     () => mockTts,
 );
+
+// Polyfill Response/Blob if missing in jsdom
+if (typeof globalThis.Response === 'undefined') {
+    const { Blob } = await import('buffer');
+    globalThis.Blob = Blob;
+    globalThis.Response = class Response {
+        constructor(body, init) { this.body = body; this._init = init; this.headers = init?.headers || {}; }
+        async blob() { return this.body; }
+        async text() { return ''; }
+    };
+}
 
 const { PocketTtsProvider } = await import('../pocket-tts.js');
 
@@ -188,21 +198,46 @@ describe('PocketTtsProvider', () => {
     // ── WebSocket Disconnect ─────────────────────────
 
     describe('_disconnectWs', () => {
-        test('nulls _ws', () => {
+        test('nulls _ws and sets _wsReady false', () => {
             provider._ws = { close: () => {} };
+            provider._wsReady = true;
             provider._disconnectWs();
             expect(provider._ws).toBeNull();
-        });
-
-        test('clears reconnect timer', () => {
-            provider._wsReconnectTimer = setTimeout(() => {}, 99999);
-            provider._disconnectWs();
-            expect(provider._wsReconnectTimer).toBeNull();
+            expect(provider._wsReady).toBe(false);
         });
 
         test('tolerates null _ws', () => {
             provider._ws = null;
             expect(() => provider._disconnectWs()).not.toThrow();
+        });
+    });
+
+    // ── Request Queue ────────────────────────────────
+
+    describe('request queue', () => {
+        test('_wsQueue starts empty', () => {
+            expect(provider._wsQueue).toEqual([]);
+        });
+
+        test('_wsCurrent starts null', () => {
+            expect(provider._wsCurrent).toBeNull();
+        });
+
+        test('_wsChunks starts empty', () => {
+            expect(provider._wsChunks).toEqual([]);
+        });
+
+        test('_processQueue does nothing when queue empty', () => {
+            expect(() => provider._processQueue()).not.toThrow();
+        });
+
+        test('dispose rejects queued requests', async () => {
+            const p1 = new Promise((resolve, reject) => {
+                provider._wsQueue.push({ text: 'hi', voice: 'nova', resolve, reject, timeout: setTimeout(() => {}, 99999) });
+            });
+            provider.dispose();
+            await expect(p1).rejects.toThrow('Provider disposed');
+            expect(provider._wsQueue).toEqual([]);
         });
     });
 
@@ -223,6 +258,59 @@ describe('PocketTtsProvider', () => {
 
         test('_ws is null', () => {
             expect(provider._ws).toBeNull();
+        });
+
+        test('_wsReady is false', () => {
+            expect(provider._wsReady).toBe(false);
+        });
+    });
+
+    // ── onWsMessage ──────────────────────────────────
+
+    describe('_onWsMessage', () => {
+        test('accumulates binary chunks', () => {
+            provider._wsCurrent = { resolve: jest.fn(), reject: jest.fn(), timeout: setTimeout(() => {}, 99999) };
+            provider._wsChunks = [];
+
+            const chunk1 = new ArrayBuffer(10);
+            const chunk2 = new ArrayBuffer(5);
+            provider._onWsMessage({ data: chunk1 });
+            provider._onWsMessage({ data: chunk2 });
+
+            expect(provider._wsChunks).toHaveLength(2);
+            expect(provider._wsChunks[0]).toHaveLength(10);
+            expect(provider._wsChunks[1]).toHaveLength(5);
+
+            clearTimeout(provider._wsCurrent.timeout);
+        });
+
+        test('resolves on done with combined blob', () => {
+            const resolve = jest.fn();
+            provider._wsCurrent = { resolve, reject: jest.fn(), timeout: setTimeout(() => {}, 99999) };
+            provider._wsChunks = [new Uint8Array([1, 2, 3])];
+
+            provider._onWsMessage({ data: JSON.stringify({ status: 'done' }) });
+
+            expect(resolve).toHaveBeenCalledTimes(1);
+            expect(resolve.mock.calls[0][0]).toBeInstanceOf(Response);
+            expect(provider._wsCurrent).toBeNull();
+        });
+
+        test('rejects on error', () => {
+            const reject = jest.fn();
+            provider._wsCurrent = { resolve: jest.fn(), reject, timeout: setTimeout(() => {}, 99999) };
+            provider._wsChunks = [];
+
+            provider._onWsMessage({ data: JSON.stringify({ status: 'error', error: 'test failure' }) });
+
+            expect(reject).toHaveBeenCalledTimes(1);
+            expect(reject.mock.calls[0][0].message).toBe('test failure');
+            expect(provider._wsCurrent).toBeNull();
+        });
+
+        test('ignores messages when no current request', () => {
+            provider._wsCurrent = null;
+            expect(() => provider._onWsMessage({ data: '{"status":"done"}' })).not.toThrow();
         });
     });
 });
