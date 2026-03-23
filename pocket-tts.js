@@ -1,6 +1,5 @@
 // pocket-tts.js — SillyTavern TTS Provider for pocket-tts-openapi
-// Supports HTTP streaming (GET) and standard generation (POST).
-// WebSocket optional for real-time streaming.
+// WebSocket-only audio generation. All audio goes through WS.
 
 import { saveTtsProviderSettings, getPreviewString } from '../../tts/index.js';
 
@@ -15,22 +14,33 @@ class PocketTtsProvider {
     audioElement = document.createElement('audio');
 
     _ws = null;
-    _wsBuffer = [];
-    _wsResolve = null;
+    _wsReconnectTimer = null;
+
+    static MODEL_OPTIONS = [
+        { value: 'tts-1',          label: 'tts-1 (Fast CPU)' },
+        { value: 'tts-1-hd',       label: 'tts-1-hd (Quality CPU)' },
+        { value: 'tts-1-cuda',     label: 'tts-1-cuda (Fast GPU)' },
+        { value: 'tts-1-hd-cuda',  label: 'tts-1-hd-cuda (Quality GPU)' },
+    ];
 
     defaultSettings = {
         provider_endpoint: 'http://localhost:8005',
         voice: 'nova',
         format: 'mp3',
         speed: 1.0,
-        language: 'en',
-        streaming: true,
         temperature: 1.0,
         top_p: 1.0,
+        model: 'tts-1',
         voiceMap: {},
     };
 
+    // ─── Settings HTML ──────────────────────────────────────────────
+
     get settingsHtml() {
+        const modelOptions = PocketTtsProvider.MODEL_OPTIONS
+            .map(m => `<option value="${m.value}"${this.defaultSettings.model === m.value ? ' selected' : ''}>${m.label}</option>`)
+            .join('');
+
         return `
         <div class="pocket-tts-settings">
             <label for="ptts_endpoint">Server Endpoint:</label>
@@ -41,6 +51,11 @@ class PocketTtsProvider {
             <div id="ptts_status" style="margin:4px 0;font-size:0.85em;">
                 <span style="color:#888;">●</span> Not connected
             </div>
+
+            <label for="ptts_model">Model:</label>
+            <select id="ptts_model" class="text_pole">
+                ${modelOptions}
+            </select>
 
             <label for="ptts_format">Audio Format:</label>
             <select id="ptts_format" class="text_pole">
@@ -62,14 +77,11 @@ class PocketTtsProvider {
             <label for="ptts_top_p">Top P: <span id="ptts_top_p_val">${this.defaultSettings.top_p}</span></label>
             <input id="ptts_top_p" type="range" min="0.0" max="1.0" step="0.05"
                 value="${this.defaultSettings.top_p}" />
-
-            <label for="ptts_streaming" class="checkbox_label">
-                <input id="ptts_streaming" type="checkbox" ${this.defaultSettings.streaming ? 'checked' : ''} />
-                Streaming (direct URL, faster start)
-            </label>
         </div>
         `;
     }
+
+    // ─── Status ─────────────────────────────────────────────────────
 
     _updateStatus(connected) {
         const el = document.getElementById('ptts_status');
@@ -83,20 +95,26 @@ class PocketTtsProvider {
         const el = document.getElementById('ptts_server_info');
         if (!el || !info) return;
         const parts = [];
-        if (info.device) parts.push(`Device: ${info.device}`);
-        if (info.sample_rate) parts.push(`${info.sample_rate}Hz`);
-        if (info.voice_cloning) parts.push('Cloning: ON');
+        if (info.device) parts.push('Device: ' + info.device);
+        if (info.sample_rate) parts.push(info.sample_rate + 'Hz');
+        if (info.voice_cloning) {
+            parts.push('Voice cloning: ON (custom .wav files in voices/ are usable)');
+        } else {
+            parts.push('Voice cloning: OFF (preset voices only)');
+        }
         el.textContent = parts.join(' | ');
         el.style.color = '#6a6';
     }
 
+    // ─── Settings Load / Change ─────────────────────────────────────
+
     onSettingsChange() {
         this.settings.provider_endpoint = String($('#ptts_endpoint').val());
+        this.settings.model = String($('#ptts_model').val());
         this.settings.format = String($('#ptts_format').val());
         this.settings.speed = parseFloat($('#ptts_speed').val());
         this.settings.temperature = parseFloat($('#ptts_temperature').val());
         this.settings.top_p = parseFloat($('#ptts_top_p').val());
-        this.settings.streaming = $('#ptts_streaming').is(':checked');
 
         $('#ptts_speed_val').text(this.settings.speed);
         $('#ptts_temperature_val').text(this.settings.temperature);
@@ -116,6 +134,7 @@ class PocketTtsProvider {
         }
 
         $('#ptts_endpoint').val(this.settings.provider_endpoint);
+        $('#ptts_model').val(this.settings.model);
         $('#ptts_format').val(this.settings.format);
         $('#ptts_speed').val(this.settings.speed);
         $('#ptts_speed_val').text(this.settings.speed);
@@ -123,14 +142,13 @@ class PocketTtsProvider {
         $('#ptts_temperature_val').text(this.settings.temperature);
         $('#ptts_top_p').val(this.settings.top_p);
         $('#ptts_top_p_val').text(this.settings.top_p);
-        $('#ptts_streaming').prop('checked', this.settings.streaming);
 
         $('#ptts_endpoint').on('input', () => this.onSettingsChange());
+        $('#ptts_model').on('change', () => this.onSettingsChange());
         $('#ptts_format').on('change', () => this.onSettingsChange());
         $('#ptts_speed').on('input', () => this.onSettingsChange());
         $('#ptts_temperature').on('input', () => this.onSettingsChange());
         $('#ptts_top_p').on('input', () => this.onSettingsChange());
-        $('#ptts_streaming').on('change', () => this.onSettingsChange());
 
         window._pttsProvider = this;
         await this._loadVoices();
@@ -140,10 +158,12 @@ class PocketTtsProvider {
         console.debug('PocketTTS: Settings loaded');
     }
 
+    // ─── Readiness ──────────────────────────────────────────────────
+
     async checkReady() {
         try {
             const url = this.settings.provider_endpoint.replace(/\/$/, '');
-            const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(3000) });
+            const resp = await fetch(url + '/health', { signal: AbortSignal.timeout(3000) });
             if (resp.ok) {
                 const data = await resp.json();
                 this.ready = data.model_loaded === true;
@@ -168,21 +188,23 @@ class PocketTtsProvider {
     async _loadVoices() {
         try {
             const url = this.settings.provider_endpoint.replace(/\/$/, '');
-            const resp = await fetch(`${url}/v1/voices`, { signal: AbortSignal.timeout(3000) });
+            const resp = await fetch(url + '/v1/voices', { signal: AbortSignal.timeout(3000) });
             if (resp.ok) {
                 const data = await resp.json();
                 this.voices = (data.voices || []).map(v => ({
                     name: v,
                     voice_id: v,
-                    lang: this.settings.language,
+                    lang: 'en',
                 }));
                 return this.voices;
             }
         } catch { /* server unavailable */ }
 
-        this.voices = ['nova', 'alloy', 'echo', 'fable', 'onyx', 'shimmer',
-            'alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma']
-            .map(v => ({ name: v, voice_id: v, lang: this.settings.language }));
+        // Fallback: all built-in voices
+        this.voices = [
+            'nova', 'alloy', 'echo', 'fable', 'onyx', 'shimmer',
+            'alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma',
+        ].map(v => ({ name: v, voice_id: v, lang: 'en' }));
         return this.voices;
     }
 
@@ -192,7 +214,7 @@ class PocketTtsProvider {
         }
         const match = this.voices.find(v => v.name === voiceName);
         if (!match) {
-            throw `TTS Voice name "${voiceName}" not found`;
+            throw 'TTS Voice name "' + voiceName + '" not found';
         }
         return match;
     }
@@ -204,152 +226,58 @@ class PocketTtsProvider {
         return this.voices;
     }
 
-    // ─── TTS Generation ────────────────────────────────────────────
+    // ─── TTS Generation (WebSocket) ────────────────────────────────
 
     async generateTts(text, voiceId) {
-        console.debug(`PocketTTS: Generating for voice "${voiceId}", ${text.length} chars`);
-
-        if (this.settings.streaming) {
-            return this._generateStreamingUrl(text, voiceId);
-        }
-
-        return this._generateViaPost(text, voiceId);
+        console.debug('PocketTTS: WS generate, voice="' + voiceId + '", ' + text.length + ' chars');
+        return this._generateViaWs(text, voiceId);
     }
 
-    _generateStreamingUrl(text, voiceId) {
-        const base = this.settings.provider_endpoint.replace(/\/$/, '');
-        const params = new URLSearchParams({
-            text: text,
-            voice: voiceId,
-            format: this.settings.format,
-            speed: this.settings.speed,
-        });
-        return `${base}/tts_stream?${params.toString()}`;
-    }
-
-    async _generateViaPost(text, voiceId) {
-        const base = this.settings.provider_endpoint.replace(/\/$/, '');
-        const response = await fetch(`${base}/v1/audio/speech`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                input: text,
-                voice: voiceId,
-                response_format: this.settings.format,
-                speed: this.settings.speed,
-                temperature: this.settings.temperature,
-                top_p: this.settings.top_p,
-            }),
-        });
-
-        if (!response.ok) {
-            const errText = await response.text();
-            toastr.error(response.statusText, 'PocketTTS Generation Failed');
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-        }
-
-        return response;
-    }
-
-    // ─── Preview ───────────────────────────────────────────────────
-
-    async previewTtsVoice(voiceId) {
-        this.audioElement.pause();
-        this.audioElement.currentTime = 0;
-
-        const text = getPreviewString(this.settings.language === 'en' ? 'en-US' : this.settings.language);
-
-        if (this.settings.streaming) {
-            this.audioElement.src = this._generateStreamingUrl(text, voiceId);
-            this.audioElement.play();
-        } else {
-            try {
-                const response = await this._generateViaPost(text, voiceId);
-                const audio = await response.blob();
-                const url = URL.createObjectURL(audio);
-                this.audioElement.src = url;
-                this.audioElement.play();
-                this.audioElement.onended = () => URL.revokeObjectURL(url);
-            } catch (err) {
-                console.error('PocketTTS preview error:', err);
-            }
-        }
-    }
-
-    // ─── WebSocket Helpers ─────────────────────────────────────────
-
-    _getWsUrl(path = '/v1/audio/stream') {
-        let ep = this.settings.provider_endpoint.replace(/\/$/, '');
-        if (ep.startsWith('http://')) ep = ep.replace('http://', 'ws://');
-        else if (ep.startsWith('https://')) ep = ep.replace('https://', 'wss://');
-        if (!ep.startsWith('ws://') && !ep.startsWith('wss://')) ep = 'ws://' + ep;
-        return ep + path;
-    }
-
-    async connectWs() {
-        if (this._ws && this._ws.readyState === WebSocket.OPEN) return this._ws;
-        this._disconnectWs();
-
-        return new Promise((resolve, reject) => {
-            this._ws = new WebSocket(this._getWsUrl());
-            this._ws.binaryType = 'arraybuffer';
-
-            this._ws.onopen = () => {
-                console.debug('PocketTTS: WebSocket connected');
-                resolve(this._ws);
-            };
-
-            this._ws.onerror = (err) => {
-                console.error('PocketTTS: WebSocket error', err);
-                reject(err);
-            };
-
-            this._ws.onmessage = (event) => {
-                if (this._wsResolve) {
-                    this._wsResolve(event.data);
-                    this._wsResolve = null;
-                } else {
-                    this._wsBuffer.push(event.data);
-                }
-            };
-        });
-    }
-
-    async generateTtsWs(text, voiceId) {
-        const ws = await this.connectWs();
+    async _generateViaWs(text, voiceId) {
+        const ws = await this._connectWs();
 
         return new Promise((resolve, reject) => {
             const chunks = [];
-            let done = false;
+            let settled = false;
 
-            const handler = (event) => {
+            const onMsg = (event) => {
                 if (event.data instanceof ArrayBuffer) {
                     chunks.push(new Uint8Array(event.data));
                 } else {
                     try {
                         const msg = JSON.parse(event.data);
                         if (msg.status === 'done') {
-                            done = true;
-                            ws.removeEventListener('message', handler);
-
+                            finish();
                             const totalLen = chunks.reduce((s, c) => s + c.length, 0);
                             const combined = new Uint8Array(totalLen);
-                            let offset = 0;
-                            for (const chunk of chunks) {
-                                combined.set(chunk, offset);
-                                offset += chunk.length;
-                            }
-                            const mime = this._getMimeType();
-                            resolve(new Blob([combined], { type: mime }));
+                            let off = 0;
+                            for (const ch of chunks) { combined.set(ch, off); off += ch.length; }
+                            const blob = new Blob([combined], { type: this._getMimeType() });
+                            resolve(new Response(blob, { headers: { 'Content-Type': blob.type } }));
                         } else if (msg.status === 'error') {
-                            ws.removeEventListener('message', handler);
+                            finish();
                             reject(new Error(msg.error || 'WebSocket TTS error'));
                         }
-                    } catch { /* ignore parse errors */ }
+                    } catch { /* ignore stray text frames */ }
                 }
             };
 
-            ws.addEventListener('message', handler);
+            const onErr = () => { finish(); reject(new Error('WebSocket error')); };
+            const onClose = () => { if (!settled) { finish(); reject(new Error('WebSocket closed')); } };
+
+            const timeout = setTimeout(() => { if (!settled) { finish(); reject(new Error('WebSocket TTS timeout (120s)')); } }, 120000);
+
+            function finish() {
+                settled = true;
+                clearTimeout(timeout);
+                ws.removeEventListener('message', onMsg);
+                ws.removeEventListener('error', onErr);
+                ws.removeEventListener('close', onClose);
+            }
+
+            ws.addEventListener('message', onMsg);
+            ws.addEventListener('error', onErr);
+            ws.addEventListener('close', onClose);
 
             ws.send(JSON.stringify({
                 text: text,
@@ -358,14 +286,73 @@ class PocketTtsProvider {
                 speed: this.settings.speed,
                 temperature: this.settings.temperature,
                 top_p: this.settings.top_p,
+                model: this.settings.model,
             }));
+        });
+    }
 
-            setTimeout(() => {
-                if (!done) {
-                    ws.removeEventListener('message', handler);
-                    reject(new Error('WebSocket TTS timeout'));
-                }
-            }, 60000);
+    // ─── Preview ───────────────────────────────────────────────────
+
+    async previewTtsVoice(voiceId) {
+        this.audioElement.pause();
+        this.audioElement.currentTime = 0;
+
+        const text = getPreviewString('en-US');
+
+        try {
+            const response = await this._generateViaWs(text, voiceId);
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            this.audioElement.src = url;
+            this.audioElement.play();
+            this.audioElement.onended = () => URL.revokeObjectURL(url);
+        } catch (err) {
+            console.error('PocketTTS preview error:', err);
+        }
+    }
+
+    // ─── WebSocket Connection ──────────────────────────────────────
+
+    _getWsUrl(path) {
+        let ep = this.settings.provider_endpoint.replace(/\/$/, '');
+        if (ep.startsWith('http://')) ep = ep.replace('http://', 'ws://');
+        else if (ep.startsWith('https://')) ep = ep.replace('https://', 'wss://');
+        if (!ep.startsWith('ws://') && !ep.startsWith('wss://')) ep = 'ws://' + ep;
+        return ep + (path || '/v1/audio/stream');
+    }
+
+    async _connectWs() {
+        if (this._ws && this._ws.readyState === WebSocket.OPEN) return this._ws;
+        this._disconnectWs();
+
+        return new Promise((resolve, reject) => {
+            const ws = new WebSocket(this._getWsUrl());
+            ws.binaryType = 'arraybuffer';
+
+            const timer = setTimeout(() => {
+                ws.removeEventListener('open', onOpen);
+                ws.removeEventListener('error', onErr);
+                try { ws.close(); } catch { /* */ }
+                reject(new Error('WebSocket connection timeout'));
+            }, 10000);
+
+            const onOpen = () => {
+                clearTimeout(timer);
+                ws.removeEventListener('error', onErr);
+                console.debug('PocketTTS: WebSocket connected');
+                this._ws = ws;
+                resolve(ws);
+            };
+
+            const onErr = (err) => {
+                clearTimeout(timer);
+                ws.removeEventListener('open', onOpen);
+                console.error('PocketTTS: WebSocket connection error', err);
+                reject(new Error('WebSocket connection failed'));
+            };
+
+            ws.addEventListener('open', onOpen);
+            ws.addEventListener('error', onErr);
         });
     }
 
@@ -374,8 +361,10 @@ class PocketTtsProvider {
             try { this._ws.close(); } catch { /* */ }
             this._ws = null;
         }
-        this._wsBuffer = [];
-        this._wsResolve = null;
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
     }
 
     _getMimeType() {

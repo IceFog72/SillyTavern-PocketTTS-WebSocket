@@ -6,10 +6,10 @@
     "js": "index.js",
     "css": "",
     "author": "icefog72",
-    "version": "0.1.0",
+    "version": "1.0.0",
     "homePage": "https://github.com/IceFog72/SillyTavern-PocketTTS-WebSocket",
     "auto_update": true,
-    "description": "TTS provider for pocket-tts-openapi server. Supports HTTP streaming, voice cloning, and WebSocket real-time audio.",
+    "description": "WebSocket TTS provider for pocket-tts-openapi. Real-time audio generation with voice cloning and model selection.",
     "hooks": {
         "activate": "onActivate"
     }
