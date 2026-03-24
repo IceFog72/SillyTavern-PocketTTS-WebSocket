@@ -9,6 +9,8 @@ import { initTtsBar } from './tts-bar.js';
 
 // ─── State ─────────────────────────────────────────────────────────
 
+let adpNextSeq = 0;  // Sequence counter for ordering
+
 const adp = {
     queue: [],
     isPlaying: false,
@@ -639,29 +641,31 @@ async function adpGenerateAndPlay(text) {
     const provider = window._pttsProvider;
     if (!provider || !provider.ready) return;
     const voiceId = getVoiceId();
+    const seqNum = adpNextSeq++;  // Capture sequence number at call time
 
     try {
         const t0 = performance.now();
         const mime = getMimeType(provider.settings.format);
 
         if (typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(mime)) {
-            await adpStreamViaMediaSource(provider, text, voiceId, mime, t0);
+            await adpStreamViaMediaSource(provider, text, voiceId, mime, t0, seqNum);
         } else {
-            await adpGenerateAndPlayLegacy(provider, text, voiceId, t0);
+            await adpGenerateAndPlayLegacy(provider, text, voiceId, t0, seqNum);
         }
     } catch (err) {
         console.error('PocketTTS generation error:', err);
     }
 }
 
-async function adpStreamViaMediaSource(provider, text, voiceId, mime, t0) {
+async function adpStreamViaMediaSource(provider, text, voiceId, mime, t0, seqNum) {
     const mediaSource = new MediaSource();
     const url = URL.createObjectURL(mediaSource);
     const audio = new Audio();
     audio.src = url;
 
-    const queueItem = { audio, url, duration: text.length / 15, playStarted: false, text };
+    const queueItem = { audio, url, duration: text.length / 15, playStarted: false, text, seqNum };
     adp.queue.push(queueItem);
+    adp.queue.sort((a, b) => a.seqNum - b.seqNum);
     playNextInQueue();
 
     try {
@@ -710,7 +714,7 @@ async function adpStreamViaMediaSource(provider, text, voiceId, mime, t0) {
     console.debug(`PocketTTS: ${Math.round(duration * 1000)}ms audio, first chunk ${firstChunkTime ? Math.round(firstChunkTime - t0) : '?'}ms`);
 }
 
-async function adpGenerateAndPlayLegacy(provider, text, voiceId, t0) {
+async function adpGenerateAndPlayLegacy(provider, text, voiceId, t0, seqNum) {
     const blobs = [];
     for await (const response of provider.generateTts(text, voiceId)) {
         blobs.push(await response.blob());
@@ -718,7 +722,8 @@ async function adpGenerateAndPlayLegacy(provider, text, voiceId, t0) {
     const combined = new Blob(blobs, { type: blobs[0]?.type || 'audio/mpeg' });
     const url = URL.createObjectURL(combined);
     const duration = provider.lastTiming.audio_duration || (text.length / 15);
-    adp.queue.push({ blob: combined, url, duration, text });
+    adp.queue.push({ blob: combined, url, duration, text, seqNum });
+    adp.queue.sort((a, b) => a.seqNum - b.seqNum);
     playNextInQueue();
 }
 
