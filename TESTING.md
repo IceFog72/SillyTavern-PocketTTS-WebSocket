@@ -162,16 +162,47 @@ console.log('Voices:', p.voices.length);
 console.log('Model:', p.settings.model);
 
 // Test WebSocket generation directly
-p._generateViaWs('Hello from test', 'nova').then(blob => {
-    console.log('Got blob:', blob.type, blob.size, 'bytes');
+p.generateTts('Hello from test', 'nova').then(resp => {
+    console.log('Got response:', resp.status);
+    return resp.blob();
+}).then(blob => {
+    console.log('Blob:', blob.type, blob.size, 'bytes');
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
     audio.play();
     audio.onended = () => URL.revokeObjectURL(url);
 }).catch(err => console.error('Failed:', err));
+
+// Check timing from last generation
+console.log('Last timing:', p.lastTiming);
 ```
 
-## 6. Troubleshooting
+## 6. Adaptive Streaming Verification
+
+Adaptive streaming is **always on** — no toggle. To verify it works:
+
+1. Enable TTS auto-generation in SillyTavern settings
+2. Start a chat with a character that has a voice mapped
+3. Send a message, watch the LLM generate
+4. Open browser console (F12)
+
+Expected console output during streaming:
+```
+PocketTTS: Adaptive observer started on mes 42
+PocketTTS: 1840ms audio in 969ms (1.9x, ema 1.9x) | buffer 0.0s | "Hello, how are you doing tod…"
+PocketTTS: 3200ms audio in 1680ms (1.9x, ema 1.9x) | buffer 1.8s | "I'm quite well thank you. The weather is lovely…"
+PocketTTS: gap padded with 500ms silence
+PocketTTS: 2100ms audio in 1100ms (1.9x, ema 1.9x) | buffer 0.5s | "Indeed it is a beautiful day…"
+```
+
+What to look for:
+- **`buffer` increases** as audio queues up — should stay above 0 after first sentence
+- **`ema` converges** to the server's real speed (usually 1.5-2.5x)
+- **Chunk text gets longer** as buffer grows (1 sentence → 2-3 sentences)
+- **"gap padded"** appears if buffer runs dry — 500ms silence prevents audio glitches
+- **`generateTtsTimed`** in console shows server-reported `audio_duration` and `gen_time`
+
+## 7. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|

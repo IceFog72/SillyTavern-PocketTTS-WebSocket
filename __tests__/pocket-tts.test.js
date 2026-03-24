@@ -223,17 +223,18 @@ describe('PocketTtsProvider', () => {
             expect(provider._wsCurrent).toBeNull();
         });
 
-        test('_wsChunks starts empty', () => {
-            expect(provider._wsChunks).toEqual([]);
-        });
-
         test('_processQueue does nothing when queue empty', () => {
             expect(() => provider._processQueue()).not.toThrow();
         });
 
         test('dispose rejects queued requests', async () => {
             const p1 = new Promise((resolve, reject) => {
-                provider._wsQueue.push({ text: 'hi', voice: 'nova', resolve, reject, timeout: setTimeout(() => {}, 99999) });
+                provider._wsQueue.push({
+                    text: 'hi', voice: 'nova',
+                    streamController: () => null,
+                    resolve, reject,
+                    timeout: setTimeout(() => {}, 99999),
+                });
             });
             provider.dispose();
             await expect(p1).rejects.toThrow('Provider disposed');
@@ -265,52 +266,93 @@ describe('PocketTtsProvider', () => {
         });
     });
 
-    // ── onWsMessage ──────────────────────────────────
+    // ── onWsMessage (streaming) ──────────────────────
 
     describe('_onWsMessage', () => {
-        test('accumulates binary chunks', () => {
-            provider._wsCurrent = { resolve: jest.fn(), reject: jest.fn(), timeout: setTimeout(() => {}, 99999) };
-            provider._wsChunks = [];
+        test('enqueues binary chunks to stream controller', () => {
+            const chunks = [];
+            const ctrl = { enqueue: (data) => chunks.push(data) };
+            provider._wsCurrent = {
+                streamController: () => ctrl,
+                resolve: jest.fn(), reject: jest.fn(),
+                timeout: setTimeout(() => {}, 99999),
+            };
 
-            const chunk1 = new ArrayBuffer(10);
-            const chunk2 = new ArrayBuffer(5);
-            provider._onWsMessage({ data: chunk1 });
-            provider._onWsMessage({ data: chunk2 });
+            provider._onWsMessage({ data: new ArrayBuffer(10) });
+            provider._onWsMessage({ data: new ArrayBuffer(5) });
 
-            expect(provider._wsChunks).toHaveLength(2);
-            expect(provider._wsChunks[0]).toHaveLength(10);
-            expect(provider._wsChunks[1]).toHaveLength(5);
+            expect(chunks).toHaveLength(2);
+            expect(chunks[0]).toHaveLength(10);
+            expect(chunks[1]).toHaveLength(5);
 
             clearTimeout(provider._wsCurrent.timeout);
         });
 
-        test('resolves on done with combined blob', () => {
-            const resolve = jest.fn();
-            provider._wsCurrent = { resolve, reject: jest.fn(), timeout: setTimeout(() => {}, 99999) };
-            provider._wsChunks = [new Uint8Array([1, 2, 3])];
+        test('closes stream controller on done', () => {
+            const closed = jest.fn();
+            const ctrl = { enqueue: jest.fn(), close: closed };
+            provider._wsCurrent = {
+                streamController: () => ctrl,
+                resolve: jest.fn(), reject: jest.fn(),
+                timeout: setTimeout(() => {}, 99999),
+            };
 
-            provider._onWsMessage({ data: JSON.stringify({ status: 'done' }) });
+            provider._onWsMessage({ data: JSON.stringify({ status: 'done', audio_duration: 2.5, gen_time: 1.3 }) });
 
-            expect(resolve).toHaveBeenCalledTimes(1);
-            expect(resolve.mock.calls[0][0]).toBeInstanceOf(Response);
+            expect(closed).toHaveBeenCalledTimes(1);
             expect(provider._wsCurrent).toBeNull();
+            expect(provider.lastTiming.audio_duration).toBe(2.5);
+            expect(provider.lastTiming.gen_time).toBe(1.3);
         });
 
-        test('rejects on error', () => {
-            const reject = jest.fn();
-            provider._wsCurrent = { resolve: jest.fn(), reject, timeout: setTimeout(() => {}, 99999) };
-            provider._wsChunks = [];
+        test('errors stream controller on error', () => {
+            const errored = jest.fn();
+            const ctrl = { enqueue: jest.fn(), error: errored };
+            provider._wsCurrent = {
+                streamController: () => ctrl,
+                resolve: jest.fn(), reject: jest.fn(),
+                timeout: setTimeout(() => {}, 99999),
+            };
 
             provider._onWsMessage({ data: JSON.stringify({ status: 'error', error: 'test failure' }) });
 
-            expect(reject).toHaveBeenCalledTimes(1);
-            expect(reject.mock.calls[0][0].message).toBe('test failure');
+            expect(errored).toHaveBeenCalledTimes(1);
+            expect(errored.mock.calls[0][0].message).toBe('test failure');
             expect(provider._wsCurrent).toBeNull();
         });
 
         test('ignores messages when no current request', () => {
             provider._wsCurrent = null;
             expect(() => provider._onWsMessage({ data: '{"status":"done"}' })).not.toThrow();
+        });
+    });
+
+    // ── lastTiming ───────────────────────────────────
+
+    describe('lastTiming', () => {
+        test('defaults to zeros', () => {
+            expect(provider.lastTiming.audio_duration).toBe(0);
+            expect(provider.lastTiming.gen_time).toBe(0);
+        });
+    });
+
+    // ── generateTtsTimed ─────────────────────────────
+
+    describe('generateTtsTimed', () => {
+        test('returns response and timing', async () => {
+            const mockResp = new Response(new Blob([new Uint8Array([1])]), {
+                headers: { 'Content-Type': 'audio/mpeg' },
+            });
+            provider.generateTts = jest.fn(async () => {
+                provider.lastTiming = { audio_duration: 3.2, gen_time: 1.6 };
+                return mockResp;
+            });
+
+            const result = await provider.generateTtsTimed('hello', 'nova');
+
+            expect(result.response).toBeInstanceOf(Response);
+            expect(result.audioDuration).toBe(3.2);
+            expect(result.genTime).toBe(1.6);
         });
     });
 });

@@ -16,9 +16,11 @@ class PocketTtsProvider {
     // Persistent WS state
     _ws = null;
     _wsReady = false;
-    _wsQueue = [];       // pending requests: [{text, voice, resolve, reject, timeout}]
+    _wsQueue = [];       // pending requests: [{text, voice, streamController, resolve, reject, timeout}]
     _wsCurrent = null;   // currently processing request
-    _wsChunks = [];      // binary chunks for current request
+
+    // Timing from last generation (server-reported)
+    lastTiming = { audio_duration: 0, gen_time: 0 };
 
     static MODEL_OPTIONS = [
         { value: 'tts-1', label: 'tts-1 (Fast CPU)' },
@@ -235,24 +237,125 @@ class PocketTtsProvider {
         return this.voices;
     }
 
-    // ─── TTS Generation (Persistent WS) ────────────────────────────
+    // ─── TTS Generation (Persistent WS, Streaming Response) ───────
 
-    async generateTts(text, voiceId) {
+    /**
+     * Generate TTS audio. Splits text by sentences, sends each to the server
+     * separately. Returns an async generator that yields one Response per
+     * sentence with exact server-reported duration.
+     * SillyTavern processes each yield immediately: addAudioJob → play.
+     */
+    async *generateTts(text, voiceId) {
         console.debug('PocketTTS: generate, voice="' + voiceId + '", ' + text.length + ' chars');
-        return new Promise((resolve, reject) => {
-            const req = { text, voice: voiceId, resolve, reject };
-            req.timeout = setTimeout(() => {
-                const idx = this._wsQueue.indexOf(req);
-                if (idx >= 0) this._wsQueue.splice(idx, 1);
-                if (this._wsCurrent === req) this._wsCurrent = null;
-                reject(new Error('TTS request timeout (120s)'));
-                this._updateStatus(this.ready);
-            }, 120000);
 
-            this._wsQueue.push(req);
-            this._updateStatus(this.ready);
-            this._processQueue();
+        // Split into sentences, keep punctuation attached
+        const parts = text.match(/[^.!?…]+[.!?…]+|[^.!?…]+/g) || [text];
+
+        for (const sentence of parts) {
+            const trimmed = sentence.trim();
+            if (!trimmed) continue;
+
+            // Queue one request per sentence via persistent WS
+            const response = await new Promise((resolve, reject) => {
+                let streamController;
+                const stream = new ReadableStream({
+                    start(ctrl) { streamController = ctrl; },
+                });
+
+                const req = {
+                    text: trimmed, voice: voiceId,
+                    streamController: () => streamController,
+                    resolve, reject,
+                };
+
+                req.timeout = setTimeout(() => {
+                    const idx = this._wsQueue.indexOf(req);
+                    if (idx >= 0) this._wsQueue.splice(idx, 1);
+                    if (this._wsCurrent === req) this._wsCurrent = null;
+                    reject(new Error('TTS timeout'));
+                    this._updateStatus(this.ready);
+                }, 120000);
+
+                this._wsQueue.push(req);
+                this._updateStatus(this.ready);
+                this._processQueue();
+
+                // Resolve with the streaming Response — chunks accumulate via _onWsMessage
+                resolve(new Response(stream, { headers: { 'Content-Type': this._getMimeType() } }));
+            });
+
+            yield response;
+        }
+    }
+
+    /**
+     * Generate TTS and return both the Response and server-reported timing.
+     * @param {string} text
+     * @param {string} voiceId
+     * @returns {Promise<{response: Response, audioDuration: number, genTime: number}>}
+     */
+    async generateTtsTimed(text, voiceId) {
+        const t0 = performance.now();
+        const response = await this.generateTts(text, voiceId);
+        const wallTime = (performance.now() - t0) / 1000;
+        const timing = { ...this.lastTiming };
+        // Fall back to wall time if server didn't report gen_time
+        if (!timing.gen_time) timing.gen_time = wallTime;
+        return { response, audioDuration: timing.audio_duration, genTime: timing.gen_time };
+    }
+
+    /**
+     * Stream TTS audio in real-time via MediaSource.
+     * Returns a ReadableStream of binary chunks + a done promise.
+     * @param {string} text
+     * @param {string} voiceId
+     * @returns {Promise<{stream: ReadableStream, done: Promise<{audioDuration: number, genTime: number}>}>}
+     */
+    async generateTtsStreaming(text, voiceId) {
+        const ws = await this._ensureWs();
+        const self = this;
+        const prevHandler = ws.onmessage;
+
+        let streamController;
+        let resolveDone;
+        const done = new Promise(r => { resolveDone = r; });
+
+        ws.onmessage = function (event) {
+            if (event.data instanceof ArrayBuffer) {
+                if (streamController) streamController.enqueue(new Uint8Array(event.data));
+            } else {
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (msg.status === 'done') {
+                        self.lastTiming = {
+                            audio_duration: msg.audio_duration || 0,
+                            gen_time: msg.gen_time || 0,
+                        };
+                        if (streamController) streamController.close();
+                        ws.onmessage = prevHandler;
+                        resolveDone(self.lastTiming);
+                    } else if (msg.status === 'error') {
+                        if (streamController) streamController.error(new Error(msg.error));
+                        ws.onmessage = prevHandler;
+                        resolveDone({ audio_duration: 0, gen_time: 0 });
+                    }
+                } catch { /* ignore */ }
+            }
+        };
+
+        const stream = new ReadableStream({
+            start(controller) { streamController = controller; },
+            cancel() { ws.onmessage = prevHandler; },
         });
+
+        ws.send(JSON.stringify({
+            text, voice: voiceId,
+            format: this.settings.format, speed: this.settings.speed,
+            temperature: this.settings.temperature, top_p: this.settings.top_p,
+            model: this.settings.model,
+        }));
+
+        return { stream, done };
     }
 
     async _processQueue() {
@@ -266,7 +369,6 @@ class PocketTtsProvider {
 
         try {
             const ws = await this._ensureWs();
-            this._wsChunks = [];
 
             ws.send(JSON.stringify({
                 text: this._wsCurrent.text,
@@ -290,7 +392,8 @@ class PocketTtsProvider {
         if (!this._wsCurrent) return;
 
         if (event.data instanceof ArrayBuffer) {
-            this._wsChunks.push(new Uint8Array(event.data));
+            const ctrl = this._wsCurrent.streamController();
+            if (ctrl) ctrl.enqueue(new Uint8Array(event.data));
             return;
         }
 
@@ -298,19 +401,27 @@ class PocketTtsProvider {
             const msg = JSON.parse(event.data);
             if (msg.status === 'done') {
                 clearTimeout(this._wsCurrent.timeout);
-                const totalLen = this._wsChunks.reduce((s, c) => s + c.length, 0);
-                const combined = new Uint8Array(totalLen);
-                let off = 0;
-                for (const ch of this._wsChunks) { combined.set(ch, off); off += ch.length; }
-                const blob = new Blob([combined], { type: this._getMimeType() });
-                const resp = new Response(blob, { headers: { 'Content-Type': blob.type } });
-                this._wsCurrent.resolve(resp);
+
+                this.lastTiming = {
+                    audio_duration: msg.audio_duration || 0,
+                    gen_time: msg.gen_time || 0,
+                };
+
+                // Close the stream — all chunks have been enqueued
+                const ctrl = this._wsCurrent.streamController();
+                if (ctrl) {
+                    try { ctrl.close(); } catch { /* already closed */ }
+                }
+
                 this._wsCurrent = null;
                 this._updateStatus(this.ready);
                 this._processQueue();
             } else if (msg.status === 'error') {
                 clearTimeout(this._wsCurrent.timeout);
-                this._wsCurrent.reject(new Error(msg.error || 'WebSocket TTS error'));
+                const ctrl = this._wsCurrent.streamController();
+                if (ctrl) {
+                    try { ctrl.error(new Error(msg.error)); } catch { /* */ }
+                }
                 this._wsCurrent = null;
                 this._updateStatus(this.ready);
                 this._processQueue();
