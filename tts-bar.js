@@ -10,10 +10,13 @@ export function initTtsBar(extSettings) {
 
     // Bar visibility follows ST's TTS enabled state
     function updateBarVisibility() {
-        const on = extSettings?.tts?.enabled ?? true;
+        const es = window.extension_settings || extSettings;
+        const cb = document.getElementById('tts_enabled');
+        // Use checkbox if available, fall back to settings, default to hidden
+        const on = cb ? cb.checked : (es?.tts?.enabled ?? false);
         bar.el.style.display = on ? 'flex' : 'none';
         const icon = bar.toggleBtn.querySelector('i');
-        icon.className = on ? 'fa-solid fa-volume-high' : 'fa-solid fa-volume-xmark';
+        icon.className = on ? 'fa-solid fa-toggle-on' : 'fa-solid fa-toggle-off';
     }
 
     // Toggle button clicks ST's TTS checkbox
@@ -23,47 +26,71 @@ export function initTtsBar(extSettings) {
             el.checked = !el.checked;
             el.dispatchEvent(new Event('change', { bubbles: true }));
         }
-        // extension_settings.tts.enabled is updated by ST's handler
-        setTimeout(updateBarVisibility, 100);
+        setTimeout(updateBarVisibility, 200);
     });
 
-    // Poll for visibility changes (catches ST toggling TTS from its own UI)
-    setInterval(updateBarVisibility, 1000);
+    setInterval(() => { updateBarVisibility(); updateHighlightBtn(); }, 1000);
     updateBarVisibility();
+    updateHighlightBtn();
 
-    function findAudio() {
-        if (audio) return audio;
-        audio = document.getElementById('tts_audio');
-        if (!audio) return null;
+    // Track whichever audio element is currently playing
+    let boundElements = new Set();
 
-        audio.addEventListener('play', updateState);
-        audio.addEventListener('playing', updateState);
-        audio.addEventListener('pause', updateState);
-        audio.addEventListener('ended', updateState);
-        audio.addEventListener('timeupdate', updateTime);
-        audio.addEventListener('loadedmetadata', updateDuration);
-        audio.addEventListener('volumechange', updateVol);
+    function bindAudio(el) {
+        if (!el || boundElements.has(el)) return;
+        boundElements.add(el);
+        el.addEventListener('play', () => { switchTo(el); updateState(); });
+        el.addEventListener('playing', () => { switchTo(el); updateState(); });
+        el.addEventListener('pause', updateState);
+        el.addEventListener('ended', updateState);
+        el.addEventListener('timeupdate', updateTime);
+        el.addEventListener('loadedmetadata', updateDuration);
+        el.addEventListener('volumechange', updateVol);
+    }
 
-        // Restore saved state
+    function switchTo(el) {
+        if (el === audio) return;
+        audio = el;
+        // Apply saved volume/speed to new element
         const savedVol = localStorage.getItem('ptts-bar-volume');
         if (savedVol !== null) audio.volume = parseFloat(savedVol);
-
         const savedSpeed = localStorage.getItem('ptts-bar-speed');
         if (savedSpeed !== null) {
             speedIndex = speeds.indexOf(parseFloat(savedSpeed));
             if (speedIndex < 0) speedIndex = 3;
             audio.playbackRate = speeds[speedIndex];
         }
-
         updateVol();
         bar.speed.textContent = formatSpeed(speeds[speedIndex]);
-        return audio;
     }
 
-    // Try to find audio element periodically until found
-    const finder = setInterval(() => {
-        if (findAudio()) clearInterval(finder);
-    }, 1000);
+    // Periodically scan for audio elements and bind them
+    function scanAudioElements() {
+        const pttsEl = window._pttsAudio;
+        const stEl = document.getElementById('tts_audio');
+        if (pttsEl) bindAudio(pttsEl);
+        if (stEl) bindAudio(stEl);
+
+        // Start with whichever exists
+        if (!audio) {
+            audio = pttsEl || stEl;
+            if (audio) {
+                const savedVol = localStorage.getItem('ptts-bar-volume');
+                if (savedVol !== null) audio.volume = parseFloat(savedVol);
+                const savedSpeed = localStorage.getItem('ptts-bar-speed');
+                if (savedSpeed !== null) {
+                    speedIndex = speeds.indexOf(parseFloat(savedSpeed));
+                    if (speedIndex < 0) speedIndex = 3;
+                    audio.playbackRate = speeds[speedIndex];
+                }
+                updateVol();
+                bar.speed.textContent = formatSpeed(speeds[speedIndex]);
+            }
+        }
+    }
+
+    setInterval(scanAudioElements, 1000);
+    scanAudioElements();
 
     // ─── Playback state ──────────────────────────────────
 
@@ -167,6 +194,22 @@ export function initTtsBar(extSettings) {
         a.click();
     });
 
+    // Highlight toggle — only visible for PocketTTS provider
+    function updateHighlightBtn() {
+        const es = window.extension_settings || extSettings;
+        const isPocketTts = es?.tts?.currentProvider === 'PocketTTS';
+        bar.highlightBtn.style.display = isPocketTts ? '' : 'none';
+        const on = window._pttsHighlightEnabled?.() ?? false;
+        const icon = bar.highlightBtn.querySelector('i');
+        icon.style.opacity = on ? '1' : '0.4';
+    }
+
+    bar.highlightBtn.addEventListener('click', () => {
+        window._pttsHighlightToggle?.();
+        updateHighlightBtn();
+    });
+    updateHighlightBtn();
+
     console.debug('PocketTTS: Player bar initialized');
 }
 
@@ -178,7 +221,7 @@ function createBarElements() {
 
     el.innerHTML = `
         <div class="ptts-controls">
-            <button class="ptts-btn" id="ptts-toggle" title="TTS On/Off"><i class="fa-solid fa-volume-high"></i></button>
+            <button class="ptts-btn" id="ptts-toggle" title="TTS On/Off"><i class="fa-solid fa-toggle-on"></i></button>
             <button class="ptts-btn" id="ptts-play" title="Play/Pause"><i class="fa-solid fa-play"></i></button>
             <button class="ptts-btn" id="ptts-stop" title="Stop"><i class="fa-solid fa-stop"></i></button>
             <div class="ptts-seek-wrap">
@@ -190,6 +233,7 @@ function createBarElements() {
                 <input type="range" id="ptts-volume" min="0" max="100" value="100" />
             </div>
             <span class="ptts-speed" id="ptts-speed" title="Click to change speed">1.0x</span>
+            <button class="ptts-btn" id="ptts-highlight" title="Highlight playing text"><i class="fa-solid fa-highlighter"></i></button>
             <button class="ptts-btn" id="ptts-dl" title="Download"><i class="fa-solid fa-download"></i></button>
         </div>
     `;
@@ -212,14 +256,13 @@ function createBarElements() {
         el,
         toggleBtn: el.querySelector('#ptts-toggle'),
         playBtn: el.querySelector('#ptts-play'),
-        el,
-        playBtn: el.querySelector('#ptts-play'),
         stopBtn: el.querySelector('#ptts-stop'),
         seeker: el.querySelector('#ptts-seeker'),
         time: el.querySelector('#ptts-time'),
         volBtn: el.querySelector('#ptts-vol-btn'),
         volSlider: el.querySelector('#ptts-volume'),
         speed: el.querySelector('#ptts-speed'),
+        highlightBtn: el.querySelector('#ptts-highlight'),
         dlBtn: el.querySelector('#ptts-dl'),
     };
 }
