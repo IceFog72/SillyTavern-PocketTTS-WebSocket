@@ -112,57 +112,154 @@ function generateSilenceWav(durationMs) {
 const pttsAudio = new Audio();
 pttsAudio.id = 'ptts_audio';
 
-// ─── Sentence Highlighting (overlay, non-destructive) ──────────────
+// ─── Sentence Highlighting (overlay layer) ─────────────────────────
 
 let highlightEnabled = localStorage.getItem('ptts-highlight') === 'true';
+let lastSearchOffset = 0; // resume search from here (sentences are sequential)
 
-// Create overlay element once
-const highlightOverlay = document.createElement('div');
-highlightOverlay.className = 'ptts-highlight-overlay';
-document.body.appendChild(highlightOverlay);
+// Highlight layer — sits on top of .mes_text, we control its content
+let highlightLayer = null;
+let highlightContainer = null;
 
-function clearHighlight() {
-    highlightOverlay.style.display = 'none';
+function ensureHighlightLayer() {
+    const mesEl = document.querySelector('.mes.last_mes .mes_text');
+    if (!mesEl) return null;
+
+    // Check if already wrapped
+    if (mesEl.parentElement.classList.contains('ptts-highlight-wrap')) {
+        return highlightLayer;
+    }
+
+    // Copy mes_text computed styles to wrapper
+    const mesStyle = window.getComputedStyle(mesEl);
+
+    // Wrap mes_text in a container
+    const wrap = document.createElement('div');
+    wrap.className = 'ptts-highlight-wrap';
+    wrap.style.position = 'relative';
+    wrap.style.display = mesStyle.display;
+    wrap.style.margin = mesStyle.margin;
+
+    mesEl.parentNode.insertBefore(wrap, mesEl);
+    wrap.appendChild(mesEl);
+
+    // Remove mes_text margin/padding now that wrapper has it
+    mesEl.style.margin = '0';
+    mesEl.style.padding = '0';
+
+    // Create highlight layer on top
+    const layer = document.createElement('div');
+    layer.className = 'ptts-highlight-layer';
+
+    // Copy text styles from mes_text so positions match exactly
+    layer.style.fontFamily = mesStyle.fontFamily;
+    layer.style.fontSize = mesStyle.fontSize;
+    layer.style.fontWeight = mesStyle.fontWeight;
+    layer.style.fontStyle = mesStyle.fontStyle;
+    layer.style.lineHeight = mesStyle.lineHeight;
+    layer.style.letterSpacing = mesStyle.letterSpacing;
+    layer.style.wordSpacing = mesStyle.wordSpacing;
+    layer.style.textAlign = mesStyle.textAlign;
+    layer.style.textIndent = mesStyle.textIndent;
+    layer.style.margin = '0';
+
+    wrap.appendChild(layer);
+
+    highlightContainer = wrap;
+    highlightLayer = layer;
+    return layer;
 }
 
-function highlightForText(text) {
+function clearHighlight() {
+    if (highlightLayer) {
+        highlightLayer.innerHTML = '';
+        highlightLayer.style.display = 'none';
+    }
+    // Don't reset lastSearchOffset — it tracks position across sentences
+}
+
+function highlightForText(playingText) {
     clearHighlight();
-    if (!highlightEnabled || !text) return;
+    if (!highlightEnabled || !playingText) return;
 
     const mesEl = document.querySelector('.mes.last_mes .mes_text');
     if (!mesEl) return;
 
-    const search = text.trim();
-    if (search.length < 5) return;
+    const layer = ensureHighlightLayer();
+    if (!layer) return;
 
-    // Find text in the message using TreeWalker
-    const walker = document.createTreeWalker(mesEl, NodeFilter.SHOW_TEXT, null, false);
-    let node;
-    while ((node = walker.nextNode())) {
-        const idx = node.textContent.indexOf(search);
-        if (idx >= 0) {
-            // Create a Range over the matching text
-            const range = document.createRange();
-            range.setStart(node, idx);
-            range.setEnd(node, idx + search.length);
+    if (layer.innerHTML !== mesEl.innerHTML) {
+        layer.innerHTML = mesEl.innerHTML;
+    }
+    layer.style.display = 'block';
 
-            // Get bounding rect (viewport-relative)
-            const rect = range.getBoundingClientRect();
+    // Get words (≥3 chars)
+    const words = playingText.trim().split(/\s+/)
+        .map(w => w.replace(/[^\w]/g, '').toLowerCase())
+        .filter(w => w.length >= 3);
+    if (words.length === 0) return;
 
-            if (rect.width > 0 && rect.height > 0) {
-                // Position overlay using fixed positioning (stays correct during scroll)
-                highlightOverlay.style.display = 'block';
-                highlightOverlay.style.position = 'fixed';
-                highlightOverlay.style.left = rect.left + 'px';
-                highlightOverlay.style.top = rect.top + 'px';
-                highlightOverlay.style.width = rect.width + 'px';
-                highlightOverlay.style.height = rect.height + 'px';
-            }
+    // Build text
+    let fullText = '';
+    const tw = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT, null, false);
+    let tn;
+    while ((tn = tw.nextNode())) fullText += tn.textContent;
 
-            range.detach();
-            return;
+    const lowerText = fullText.toLowerCase();
+
+    // Find all word positions
+    const positions = [];
+    let offset = lastSearchOffset;
+    for (const word of words) {
+        const pos = lowerText.indexOf(word, offset);
+        if (pos >= 0) {
+            positions.push({ start: pos, end: pos + word.length });
+            offset = pos + word.length;
         }
     }
+
+    if (positions.length === 0) return;
+    lastSearchOffset = positions[positions.length - 1].end;
+
+    // Wrap in REVERSE — earlier wraps don't affect later DOM positions
+    for (let wi = positions.length - 1; wi >= 0; wi--) {
+        const { start: rStart, end: rEnd } = positions[wi];
+
+        // Rebuild text nodes for THIS wrap
+        const nodes = [];
+        let ft = '';
+        const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT, null, false);
+        let n;
+        while ((n = walker.nextNode())) {
+            nodes.push({ node: n, start: ft.length, end: ft.length + n.textContent.length });
+            ft += n.textContent;
+        }
+
+        for (let i = nodes.length - 1; i >= 0; i--) {
+            const { node: tNode, start: ns, end: ne } = nodes[i];
+            const ws = Math.max(rStart, ns);
+            const we = Math.min(rEnd, ne);
+            if (ws >= we) continue;
+
+            const ls = ws - ns;
+            const le = we - ns;
+            const nl = tNode.textContent.length;
+            if (ls >= nl || le > nl || ls < 0 || le < 0) continue;
+
+            let target = tNode;
+            if (le < nl) target.splitText(le);
+            let wrapNode = target;
+            if (ls > 0) wrapNode = target.splitText(ls);
+
+            const mark = document.createElement('mark');
+            mark.className = 'ptts-hl-active';
+            wrapNode.parentNode.replaceChild(mark, wrapNode);
+            mark.appendChild(wrapNode);
+        }
+    }
+
+    const firstMark = layer.querySelector('.ptts-hl-active');
+    if (firstMark) firstMark.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 window._pttsHighlightToggle = function () {
@@ -173,6 +270,56 @@ window._pttsHighlightToggle = function () {
 };
 
 window._pttsHighlightEnabled = function () { return highlightEnabled; };
+
+// ─── Text Processing (ST TTS toggle support) ──────────────────────
+
+function processTtsText(text) {
+    const es = window.extension_settings || extension_settings;
+    if (!es?.tts || !text) return text;
+
+    let processed = text;
+
+    // Skip code blocks — exact copy from ST tts/index.js line 651-655
+    if (es.tts.skip_codeblocks) {
+        processed = processed.replace(/^\s{4}.*$/gm, '').trim();
+        processed = processed.replace(/```.*?```/gs, '').trim();
+        processed = processed.replace(/~~~.*?~~~/gs, '').trim();
+    }
+
+    // Skip tagged blocks — exact copy from ST tts/index.js line 657-659
+    if (es.tts.skip_tags) {
+        processed = processed.replace(/<.*?>[\s\S]*?<\/.*?>/g, '').trim();
+    }
+
+    // Handle asterisks — exact copy from ST tts/index.js line 661-665
+    if (!es.tts.pass_asterisks) {
+        processed = es.tts.narrate_dialogues_only
+            ? processed.replace(/\*[^*]*?(\*|$)/g, '').trim()
+            : processed.replaceAll('*', '').trim();
+    }
+
+    // Apply regex filter — exact copy from ST tts/index.js line 667-675
+    if (es.tts.apply_regex && es.tts.regex_pattern) {
+        try {
+            const regex = new RegExp(es.tts.regex_pattern, 'g');
+            processed = processed.replace(regex, '').replace(/\s+/g, ' ').trim();
+        } catch { /* invalid regex */ }
+    }
+
+    // Narrate quoted only — simplified version of ST's joinQuotedBlocks
+    if (es.tts.narrate_quoted_only) {
+        const quoted = processed.match(/"[^"]*"|'[^']*'|[\u201C\u201D][^\u201C\u201D]*[\u201C\u201D]/g);
+        processed = quoted ? quoted.join(' ') : '';
+    }
+
+    // Remove embedded images — exact copy from ST tts/index.js line 683
+    processed = processed.replace(/!\[.*?]\([^)]*\)/g, '');
+
+    // Collapse whitespace — exact copy from ST tts/index.js line 690
+    processed = processed.replace(/\s+/g, ' ').trim();
+
+    return processed;
+}
 
 // ─── Audio Playback ────────────────────────────────────────────────
 
@@ -222,6 +369,7 @@ const MIME_BY_FORMAT = {
 function getMimeType(fmt) { return MIME_BY_FORMAT[fmt] || 'audio/mpeg'; }
 
 async function adpGenerateAndPlay(text) {
+    if (!text) return;
     const provider = window._pttsProvider;
     if (!provider || !provider.ready) return;
     const voiceId = getVoiceId();
@@ -275,7 +423,7 @@ async function adpStreamViaMediaSource(provider, text, voiceId, mime, t0) {
             if (!firstChunkTime) {
                 firstChunkTime = performance.now();
                 queueItem.playStarted = true;
-                audio.play().catch(() => {});
+                audio.play().catch(() => { });
             }
             while (sourceBuffer.updating) {
                 await new Promise(r => sourceBuffer.addEventListener('updateend', r, { once: true }));
@@ -376,8 +524,10 @@ function onTick() {
     if (!lastMsg || lastMsg.is_user) return;
     if (!lastMsg.mes && lastMsg.mes !== '') return;
 
-    const fullText = lastMsg.mes;
-    if (fullText.length <= adp.lastTextLen) return;
+    // Filter full text FIRST, then diff filtered version
+    const rawText = lastMsg.mes;
+    const fullText = processTtsText(rawText);
+    if (!fullText || fullText.length <= adp.lastTextLen) return;
 
     const newText = fullText.substring(adp.lastTextLen);
     adp.lastTextLen = fullText.length;
@@ -480,6 +630,7 @@ function onGenerationStarted(generationType, _args, isDryRun) {
     adp.pending = [];
     adp.lastTextLen = 0;
     adp.lastMsgId = null;
+    lastSearchOffset = 0;
     startPeriodicTimer();
 }
 

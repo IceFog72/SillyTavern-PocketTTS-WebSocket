@@ -240,6 +240,13 @@ class PocketTtsProvider {
     // ─── TTS Generation (Persistent WS, Streaming Response) ───────
 
     /**
+     * Called by ST's tts() after its own filtering. Pass through — filtering is done in onTick.
+     */
+    async processText(text) {
+        return text;
+    }
+
+    /**
      * Generate TTS audio. Splits text by sentences, sends each to the server
      * separately. Returns an async generator that yields one Response per
      * sentence with exact server-reported duration.
