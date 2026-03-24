@@ -248,14 +248,43 @@ class PocketTtsProvider {
     async *generateTts(text, voiceId) {
         console.debug('PocketTTS: generate, voice="' + voiceId + '", ' + text.length + ' chars');
 
-        // Split into sentences, keep punctuation attached
-        const parts = text.match(/[^.!?…]+[.!?…]+|[^.!?…]+/g) || [text];
+        // Split into sentences, then merge any that are too short
+        const MIN_LEN = 20; // minimum chars per sentence to send separately
+        const raw = text.match(/[^.!?…]+[.!?…]+|[^.!?…]+/g) || [text];
+        const parts = [];
+        let buf = '';
 
-        for (const sentence of parts) {
-            const trimmed = sentence.trim();
+        for (const s of raw) {
+            const trimmed = s.trim();
             if (!trimmed) continue;
 
-            // Queue one request per sentence via persistent WS
+            if (buf.length > 0 && buf.length < MIN_LEN) {
+                // Previous sentence too short — merge with this one
+                buf += ' ' + trimmed;
+            } else if (buf.length > 0) {
+                // Previous sentence long enough — flush it
+                parts.push(buf);
+                buf = trimmed;
+            } else {
+                buf = trimmed;
+            }
+        }
+        if (buf) parts.push(buf);
+
+        // Also merge any remaining short tail into the previous sentence
+        for (let i = parts.length - 1; i > 0; i--) {
+            if (parts[i].length < MIN_LEN) {
+                parts[i - 1] += ' ' + parts[i];
+                parts.splice(i, 1);
+            }
+        }
+
+        console.debug('PocketTTS: ' + parts.length + ' parts: ' + JSON.stringify(parts.map(p => p.substring(0, 40))));
+
+        for (let i = 0; i < parts.length; i++) {
+            const part = parts[i].trim();
+            if (!part) continue;
+
             const response = await new Promise((resolve, reject) => {
                 let streamController;
                 const stream = new ReadableStream({
@@ -263,7 +292,7 @@ class PocketTtsProvider {
                 });
 
                 const req = {
-                    text: trimmed, voice: voiceId,
+                    text: part, voice: voiceId,
                     streamController: () => streamController,
                     resolve, reject,
                 };
@@ -279,8 +308,6 @@ class PocketTtsProvider {
                 this._wsQueue.push(req);
                 this._updateStatus(this.ready);
                 this._processQueue();
-
-                // Resolve with the streaming Response — chunks accumulate via _onWsMessage
                 resolve(new Response(stream, { headers: { 'Content-Type': this._getMimeType() } }));
             });
 
@@ -359,9 +386,7 @@ class PocketTtsProvider {
     }
 
     async _processQueue() {
-        // Already processing a request
         if (this._wsCurrent) return;
-        // Queue empty
         if (this._wsQueue.length === 0) return;
 
         this._wsCurrent = this._wsQueue.shift();

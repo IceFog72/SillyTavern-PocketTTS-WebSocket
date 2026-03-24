@@ -490,7 +490,26 @@ function adpStopObserver() {
 
 // ─── Generation Lifecycle ──────────────────────────────────────────
 
+let audioWarmupDone = false;
+
+function warmupAudio() {
+    if (audioWarmupDone) return;
+    audioWarmupDone = true;
+
+    // Play 2s silence to wake up audio pipeline (prevents volume fade-in on some systems)
+    const silence = generateSilenceWav(2000);
+    const url = URL.createObjectURL(silence);
+    const audio = new Audio(url);
+    audio.volume = 0.01; // nearly silent, just enough to init the pipeline
+    audio.play().then(() => {
+        audio.onended = () => URL.revokeObjectURL(url);
+    }).catch(() => {
+        URL.revokeObjectURL(url);
+    });
+}
+
 function onGenerationStarted() {
+    warmupAudio();
     adp.active = true;
     adp.buffer = '';
     adp.pending = [];
