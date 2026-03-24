@@ -10,6 +10,7 @@ import { initTtsBar } from './tts-bar.js';
 // ─── State ─────────────────────────────────────────────────────────
 
 let adpNextSeq = 0;  // Sequence counter for ordering
+let nextPlaySeq = 0; // next seqNum we expect to play
 
 const adp = {
     queue: [],
@@ -407,23 +408,19 @@ function stopNarrateHighlight() {
 function updateNarrateHighlight() {
     if (!narrator.active || narrator.words.length === 0) return;
 
-    // Only accumulate elapsed time while audio is actually playing
+    // Use audio currentTime directly for accurate word tracking (like streaming mode)
     const stAudio = document.getElementById('tts_audio');
-    const audioPlaying = stAudio && !stAudio.paused;
-    const now = performance.now();
-    if (audioPlaying) {
-        narrator.elapsed += now - narrator.lastTick;
-    }
-    narrator.lastTick = now;
+    if (!stAudio || stAudio.paused) return;
 
-    // Calculate word index from elapsed time
+    // Calculate total duration from sentences
     let totalDur = 0;
     for (const s of narrator.sentences) totalDur += s.duration;
     if (totalDur <= 0) return;
 
+    // Calculate word index based on current playback position
     const totalWords = narrator.words.length;
-    const wps = totalWords / totalDur; // words per second
-    const newIdx = Math.min(Math.floor(narrator.elapsed / 1000 * wps), totalWords - 1);
+    const progress = stAudio.currentTime / totalDur;
+    const newIdx = Math.min(Math.floor(progress * totalWords), totalWords - 1);
 
     if (newIdx === narrator.wordIdx) return;
     narrator.wordIdx = newIdx;
@@ -592,9 +589,13 @@ function processTtsText(text) {
 // ─── Audio Playback ────────────────────────────────────────────────
 
 function playNextInQueue() {
-    if (adp.isPlaying || adp.queue.length === 0) return;
+    if (adp.isPlaying) return;
+    // Find the item with the correct nextPlaySeq
+    const idx = adp.queue.findIndex(item => item.seqNum === nextPlaySeq);
+    if (idx === -1) return; // not ready yet
+    const item = adp.queue.splice(idx, 1)[0];
+    nextPlaySeq++;
     adp.isPlaying = true;
-    const item = adp.queue.shift();
     adp.currentAudio = pttsAudio;
     adp.currentStart = performance.now();
 
@@ -612,12 +613,15 @@ function playNextInQueue() {
         if (item.url) URL.revokeObjectURL(item.url);
         adp.isPlaying = false;
         adp.currentAudio = null;
-        if (adp.queue.length === 0 && adp.active) {
-            const sUrl = URL.createObjectURL(generateSilenceWav(500));
-            adp.queue.push({ url: sUrl, duration: 0.5 });
-        }
         clearHighlight();
+        // Try to play the next sequential item
         playNextInQueue();
+        // If queue is empty and still active, add a small silence gap
+        if (adp.queue.length === 0 && adp.active && !adp.isPlaying) {
+            const sUrl = URL.createObjectURL(generateSilenceWav(500));
+            adp.queue.push({ url: sUrl, duration: 0.5, seqNum: nextPlaySeq });
+            playNextInQueue();
+        }
     };
 
     const audioEl = adp.currentAudio;
@@ -903,6 +907,7 @@ function onGenerationStarted(generationType, _args, isDryRun) {
     adp.lastTextLen = 0;
     adp.lastMsgId = null;
     lastSearchOffset = 0;
+    nextPlaySeq = 0;
     startPeriodicTimer();
 }
 
