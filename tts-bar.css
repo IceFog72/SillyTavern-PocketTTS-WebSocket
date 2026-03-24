@@ -1,0 +1,163 @@
+/* PocketTTS Player Bar — matches SillyTavern theme via CSS variables */
+
+#ptts-bar {
+    display: flex;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background-color: var(--SmartThemeBlurTintColor);
+    backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
+    -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
+    padding: 6px 10px;
+    margin: 4px 0;
+    font-size: calc(var(--mainFontSize, 16px) * 0.85);
+    color: var(--SmartThemeBodyColor);
+}
+
+/* Row 1: controls */
+.ptts-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ptts-btn {
+    cursor: pointer;
+    background: none;
+    border: none;
+    color: var(--SmartThemeBodyColor);
+    font-size: 1em;
+    padding: 2px 4px;
+    opacity: 0.8;
+    line-height: 1;
+}
+
+.ptts-btn:hover {
+    opacity: 1;
+}
+
+/* Seek bar */
+.ptts-seek-wrap {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+
+.ptts-time {
+    font-family: monospace;
+    font-size: 0.8em;
+    white-space: nowrap;
+    opacity: 0.7;
+    min-width: 70px;
+    text-align: center;
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+#ptts-seeker {
+    flex: 1;
+    height: 4px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+    padding: 6px 0;
+    min-width: 60px;
+}
+
+#ptts-seeker::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    height: 12px;
+    width: 4px;
+    background: #fff;
+    border-radius: 2px;
+    margin-top: -4px;
+}
+
+#ptts-seeker::-moz-range-thumb {
+    height: 12px;
+    width: 4px;
+    background: #fff;
+    border: none;
+    border-radius: 2px;
+}
+
+#ptts-seeker::-webkit-slider-runnable-track {
+    height: 2px;
+    background: #4b5563;
+    border-radius: 2px;
+}
+
+#ptts-seeker::-moz-range-track {
+    height: 2px;
+    background: #4b5563;
+    border-radius: 2px;
+}
+
+#ptts-seeker:hover::-webkit-slider-thumb { background: #e5e7eb; }
+#ptts-seeker:hover::-moz-range-thumb { background: #e5e7eb; }
+#ptts-seeker:focus { outline: none; }
+
+/* Volume */
+.ptts-vol-wrap {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    width: 80px;
+}
+
+#ptts-volume {
+    flex: 1;
+    height: 3px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+}
+
+#ptts-volume::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    height: 10px;
+    width: 10px;
+    background: #fff;
+    border-radius: 50%;
+}
+
+#ptts-volume::-webkit-slider-runnable-track {
+    height: 3px;
+    background: #4b5563;
+    border-radius: 2px;
+}
+
+#ptts-volume::-moz-range-thumb {
+    height: 10px;
+    width: 10px;
+    background: #fff;
+    border: none;
+    border-radius: 50%;
+}
+
+#ptts-volume::-moz-range-track {
+    height: 3px;
+    background: #4b5563;
+    border-radius: 2px;
+}
+
+#ptts-volume:focus { outline: none; }
+
+/* Speed */
+.ptts-speed {
+    font-family: monospace;
+    font-size: 0.8em;
+    cursor: pointer;
+    padding: 2px 4px;
+    opacity: 0.7;
+    min-width: 32px;
+    text-align: center;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.ptts-speed:hover { opacity: 1; }

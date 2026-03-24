@@ -4,7 +4,7 @@
     "requires": [],
     "optional": [],
     "js": "index.js",
-    "css": "",
+    "css": "tts-bar.css",
     "author": "icefog72",
     "version": "1.0.0",
     "homePage": "https://github.com/IceFog72/SillyTavern-PocketTTS-WebSocket",

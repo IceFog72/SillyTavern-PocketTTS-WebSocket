@@ -3,7 +3,9 @@
 
 import { registerTtsProvider } from '../../tts/index.js';
 import { event_types, eventSource } from '../../../../script.js';
+import { extension_settings } from '../../../extensions.js';
 import { PocketTtsProvider } from './pocket-tts.js';
+import { initTtsBar } from './tts-bar.js';
 
 // ─── Adaptive Streaming State ──────────────────────────────────────
 
@@ -280,7 +282,7 @@ async function adpStreamViaMediaSource(provider, text, voiceName, mime, t0) {
                 firstChunkTime = performance.now();
                 queueItem.playStarted = true;
                 // Start playback — if playNextInQueue already set this as current, audio plays now
-                audio.play().catch(() => {});
+                audio.play().catch(() => { });
             }
 
             while (sourceBuffer.updating) {
@@ -547,7 +549,20 @@ function watchChatContainer() {
 export function onActivate() {
     registerTtsProvider('PocketTTS', PocketTtsProvider);
 
-    // Always-on adaptive streaming — no toggle needed
+    // ST may have failed to load the saved provider before extensions registered.
+    // Re-select whatever was saved so the user's preference persists.
+    const savedProvider = extension_settings.tts?.currentProvider;
+    const select = document.getElementById('tts_provider');
+    if (savedProvider && select) {
+        // Check that the saved provider is now available (registered)
+        const option = select.querySelector(`option[value="${savedProvider}"]`);
+        if (option && select.value !== savedProvider) {
+            select.value = savedProvider;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
+
+    initTtsBar(extension_settings);
     waitForEvents();
 }
 

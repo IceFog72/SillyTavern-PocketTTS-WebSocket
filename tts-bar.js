@@ -1,0 +1,242 @@
+// tts-bar.js — TTS playback bar for PocketTTS extension
+
+export function initTtsBar(extSettings) {
+    const bar = createBarElements();
+
+    let audio = null;
+    let seeking = false;
+    let speedIndex = 3; // 1.0x
+    const speeds = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5];
+
+    // Bar visibility follows ST's TTS enabled state
+    function updateBarVisibility() {
+        const on = extSettings?.tts?.enabled ?? true;
+        bar.el.style.display = on ? 'flex' : 'none';
+        const icon = bar.toggleBtn.querySelector('i');
+        icon.className = on ? 'fa-solid fa-volume-high' : 'fa-solid fa-volume-xmark';
+    }
+
+    // Toggle button clicks ST's TTS checkbox
+    bar.toggleBtn.addEventListener('click', () => {
+        const el = document.querySelector('#tts_enabled');
+        if (el) {
+            el.checked = !el.checked;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        // extension_settings.tts.enabled is updated by ST's handler
+        setTimeout(updateBarVisibility, 100);
+    });
+
+    // Poll for visibility changes (catches ST toggling TTS from its own UI)
+    setInterval(updateBarVisibility, 1000);
+    updateBarVisibility();
+
+    function findAudio() {
+        if (audio) return audio;
+        audio = document.getElementById('tts_audio');
+        if (!audio) return null;
+
+        audio.addEventListener('play', updateState);
+        audio.addEventListener('playing', updateState);
+        audio.addEventListener('pause', updateState);
+        audio.addEventListener('ended', updateState);
+        audio.addEventListener('timeupdate', updateTime);
+        audio.addEventListener('loadedmetadata', updateDuration);
+        audio.addEventListener('volumechange', updateVol);
+
+        // Restore saved state
+        const savedVol = localStorage.getItem('ptts-bar-volume');
+        if (savedVol !== null) audio.volume = parseFloat(savedVol);
+
+        const savedSpeed = localStorage.getItem('ptts-bar-speed');
+        if (savedSpeed !== null) {
+            speedIndex = speeds.indexOf(parseFloat(savedSpeed));
+            if (speedIndex < 0) speedIndex = 3;
+            audio.playbackRate = speeds[speedIndex];
+        }
+
+        updateVol();
+        bar.speed.textContent = formatSpeed(speeds[speedIndex]);
+        return audio;
+    }
+
+    // Try to find audio element periodically until found
+    const finder = setInterval(() => {
+        if (findAudio()) clearInterval(finder);
+    }, 1000);
+
+    // ─── Playback state ──────────────────────────────────
+
+    function updateState() {
+        if (!audio) return;
+        const icon = bar.playBtn.querySelector('i');
+        icon.className = audio.paused ? 'fa-solid fa-play' : 'fa-solid fa-pause';
+    }
+
+    // ─── Time display ────────────────────────────────────
+
+    function updateTime() {
+        if (!audio || seeking) return;
+        bar.seeker.value = audio.currentTime;
+        bar.time.textContent = formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
+    }
+
+    function updateDuration() {
+        if (!audio) return;
+        bar.seeker.max = audio.duration || 0;
+        bar.seeker.value = audio.currentTime;
+        bar.time.textContent = formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
+    }
+
+    // ─── Volume ──────────────────────────────────────────
+
+    function updateVol() {
+        if (!audio) return;
+        bar.volSlider.value = audio.volume * 100;
+        const icon = bar.volBtn.querySelector('i');
+        if (audio.volume === 0) {
+            icon.className = 'fa-solid fa-volume-xmark';
+        } else if (audio.volume < 0.5) {
+            icon.className = 'fa-solid fa-volume-low';
+        } else {
+            icon.className = 'fa-solid fa-volume-high';
+        }
+    }
+
+    // ─── Event handlers ──────────────────────────────────
+
+    bar.playBtn.addEventListener('click', () => {
+        if (!audio) return;
+        if (audio.paused) audio.play();
+        else audio.pause();
+    });
+
+    bar.seeker.addEventListener('input', () => {
+        seeking = true;
+        audio.currentTime = parseFloat(bar.seeker.value);
+        bar.time.textContent = formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
+    });
+
+    bar.seeker.addEventListener('change', () => { seeking = false; });
+
+    bar.time.addEventListener('click', () => {
+        // Toggle between elapsed and remaining
+        if (!audio) return;
+        const remaining = audio.duration - audio.currentTime;
+        bar.time.textContent = '-' + formatTime(remaining);
+    });
+
+    bar.volSlider.addEventListener('input', () => {
+        if (!audio) return;
+        audio.volume = parseInt(bar.volSlider.value) / 100;
+        localStorage.setItem('ptts-bar-volume', audio.volume);
+    });
+
+    bar.volBtn.addEventListener('click', () => {
+        if (!audio) return;
+        if (audio.volume > 0) {
+            audio._savedVol = audio.volume;
+            audio.volume = 0;
+        } else {
+            audio.volume = audio._savedVol || 0.5;
+        }
+        updateVol();
+        localStorage.setItem('ptts-bar-volume', audio.volume);
+    });
+
+    bar.speed.addEventListener('click', () => {
+        if (!audio) return;
+        speedIndex = (speedIndex + 1) % speeds.length;
+        audio.playbackRate = speeds[speedIndex];
+        bar.speed.textContent = formatSpeed(speeds[speedIndex]);
+        localStorage.setItem('ptts-bar-speed', speeds[speedIndex]);
+    });
+
+    bar.stopBtn.addEventListener('click', () => {
+        if (!audio) return;
+        audio.pause();
+        audio.currentTime = 0;
+        audio.src = '';
+    });
+
+    bar.dlBtn.addEventListener('click', () => {
+        if (!audio || !audio.src) return;
+        const a = document.createElement('a');
+        a.href = audio.src;
+        a.download = 'tts-audio.mp3';
+        a.click();
+    });
+
+    console.debug('PocketTTS: Player bar initialized');
+}
+
+// ─── DOM creation ──────────────────────────────────────
+
+function createBarElements() {
+    const el = document.createElement('div');
+    el.id = 'ptts-bar';
+
+    el.innerHTML = `
+        <div class="ptts-controls">
+            <button class="ptts-btn" id="ptts-toggle" title="TTS On/Off"><i class="fa-solid fa-volume-high"></i></button>
+            <button class="ptts-btn" id="ptts-play" title="Play/Pause"><i class="fa-solid fa-play"></i></button>
+            <button class="ptts-btn" id="ptts-stop" title="Stop"><i class="fa-solid fa-stop"></i></button>
+            <div class="ptts-seek-wrap">
+                <span class="ptts-time" id="ptts-time" title="Click to toggle remaining">0:00 / 0:00</span>
+                <input type="range" id="ptts-seeker" min="0" max="0" step="0.1" value="0" />
+            </div>
+            <button class="ptts-btn" id="ptts-vol-btn" title="Mute/Unmute"><i class="fa-solid fa-volume-high"></i></button>
+            <div class="ptts-vol-wrap">
+                <input type="range" id="ptts-volume" min="0" max="100" value="100" />
+            </div>
+            <span class="ptts-speed" id="ptts-speed" title="Click to change speed">1.0x</span>
+            <button class="ptts-btn" id="ptts-dl" title="Download"><i class="fa-solid fa-download"></i></button>
+        </div>
+    `;
+
+    // Insert before #chat
+    const chat = document.getElementById('chat');
+    if (chat) {
+        chat.before(el);
+    } else {
+        // Fallback: try form_sheld, then body
+        const formSheld = document.getElementById('form_sheld');
+        if (formSheld) {
+            formSheld.before(el);
+        } else {
+            document.body.appendChild(el);
+        }
+    }
+
+    return {
+        el,
+        toggleBtn: el.querySelector('#ptts-toggle'),
+        playBtn: el.querySelector('#ptts-play'),
+        el,
+        playBtn: el.querySelector('#ptts-play'),
+        stopBtn: el.querySelector('#ptts-stop'),
+        seeker: el.querySelector('#ptts-seeker'),
+        time: el.querySelector('#ptts-time'),
+        volBtn: el.querySelector('#ptts-vol-btn'),
+        volSlider: el.querySelector('#ptts-volume'),
+        speed: el.querySelector('#ptts-speed'),
+        dlBtn: el.querySelector('#ptts-dl'),
+    };
+}
+
+function injectCSS() {
+    // CSS is loaded via manifest.json — no inline injection needed
+}
+
+// ─── Helpers ──────────────────────────────────────────
+
+function formatTime(sec) {
+    if (!sec || !isFinite(sec)) return '0:00';
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function formatSpeed(speed) {
+    return speed.toFixed(1) + 'x';
+}

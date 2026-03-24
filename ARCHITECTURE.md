@@ -83,6 +83,7 @@ Server runs on `http://localhost:8005`.
 curl http://localhost:8005/health
 ```
 
+
 ### WebSocket Endpoint: `/v1/audio/stream`
 
 **Protocol:**
