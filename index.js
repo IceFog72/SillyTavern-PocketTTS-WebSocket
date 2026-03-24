@@ -25,6 +25,23 @@ const adp = {
     decisionTimer: null,
 };
 
+// ─── Narrate Highlight State ───────────────────────────────────────
+// Used when user clicks Narrate — tracks ST's audio playback to show
+// word-by-word highlighting synced to audio.
+
+const narrator = {
+    active: false,
+    messageId: null,
+    text: '',        // accumulated filtered text from TTS_AUDIO_READY
+    words: [],       // [{start, end, text}]
+    wordIdx: 0,
+    elapsed: 0,      // real elapsed play time in ms (accumulated by timer ticks)
+    lastTick: 0,     // performance.now() of last timer tick
+    sentences: [{ text: '', duration: 0 }],
+};
+
+let narratorTimer = null;
+
 // ─── Sentence Detection ────────────────────────────────────────────
 
 const SENTENCE_END = /[.!?…][)"'\u2019\u201D\u00BB\u300D\u300F\uFF02]*\s+/g;
@@ -124,6 +141,8 @@ let highlightContainer = null;
 function ensureHighlightLayer() {
     const mesEl = document.querySelector('.mes.last_mes .mes_text');
     if (!mesEl) return null;
+    // Skip system messages
+    if (mesEl.closest('.smallSysMes')) return null;
 
     // Check if already wrapped
     if (mesEl.parentElement.classList.contains('ptts-highlight-wrap')) {
@@ -171,10 +190,18 @@ function ensureHighlightLayer() {
 }
 
 function clearHighlight() {
-    if (highlightLayer) {
-        highlightLayer.innerHTML = '';
-        highlightLayer.style.display = 'none';
+    // Unwrap mes_text from highlight wrap if present
+    if (highlightContainer && highlightContainer.classList.contains('ptts-highlight-wrap')) {
+        const mesText = highlightContainer.querySelector('.mes_text');
+        if (mesText && highlightContainer.parentNode) {
+            highlightContainer.parentNode.insertBefore(mesText, highlightContainer);
+            mesText.style.margin = '';
+            mesText.style.padding = '';
+        }
+        highlightContainer.remove();
     }
+    highlightLayer = null;
+    highlightContainer = null;
     // Don't reset lastSearchOffset — it tracks position across sentences
 }
 
@@ -262,10 +289,249 @@ function highlightForText(playingText) {
     if (firstMark) firstMark.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
+// ─── Narrate Highlight ─────────────────────────────────────────────
+
+async function getAudioDuration(blobOrUrl) {
+    return new Promise(resolve => {
+        let url;
+        if (blobOrUrl instanceof Blob) {
+            url = URL.createObjectURL(blobOrUrl);
+        } else if (typeof blobOrUrl === 'string') {
+            url = blobOrUrl;
+        } else {
+            resolve(0);
+            return;
+        }
+        const a = new Audio();
+        a.preload = 'metadata';
+        a.onloadedmetadata = () => {
+            const d = a.duration;
+            if (blobOrUrl instanceof Blob) URL.revokeObjectURL(url);
+            resolve(isFinite(d) && d > 0 ? d : 0);
+        };
+        a.onerror = () => {
+            if (blobOrUrl instanceof Blob) URL.revokeObjectURL(url);
+            resolve(0);
+        };
+        a.src = url;
+    });
+}
+
+function buildWordHtml(text) {
+    const words = [];
+    let html = '';
+    let lastEnd = 0;
+    const re = /[\w']+/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        html += text.substring(lastEnd, m.index);
+        const idx = words.length;
+        words.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
+        html += `<mark class="ptts-hl-word" data-wi="${idx}">${m[0]}</mark>`;
+        lastEnd = m.index + m[0].length;
+    }
+    html += text.substring(lastEnd);
+    return { html, words };
+}
+
+function startNarrateHighlight(text, messageId) {
+    if (!highlightEnabled || !text) return;
+    stopNarrateHighlight();
+
+    // Skip system messages — check chat data
+    if (messageId != null) {
+        const context = window.SillyTavern?.getContext?.();
+        const msg = context?.chat?.[messageId];
+        if (msg?.is_system) return;
+    }
+
+    narrator.active = true;
+    narrator.messageId = messageId;
+    narrator.text = text;
+    narrator.wordIdx = 0;
+    narrator.elapsed = 0;
+    narrator.lastTick = performance.now();
+    narrator.sentences = [{ text: '', duration: 0 }];
+
+    const { html, words } = buildWordHtml(text);
+    narrator.words = words;
+    if (words.length === 0) return;
+
+    let target = null;
+    if (messageId != null) {
+        target = document.querySelector(`.mes[mesid="${messageId}"] .mes_text`);
+    }
+    // Skip .smallSysMes elements
+    if (target && target.closest('.smallSysMes')) return;
+    if (!target) target = document.querySelector('.mes.last_mes .mes_text');
+    if (!target || target.closest('.smallSysMes')) return;
+
+    const layer = ensureHighlightLayerFor(target);
+    if (!layer) return;
+    layer.innerHTML = html;
+    layer.style.display = 'block';
+
+    // Start tracking elapsed time using ST audio element's currentTime
+    narratorTimer = setInterval(updateNarrateHighlight, 150);
+}
+
+async function onNarrateAudioReady(data) {
+    if (!narrator.active) return;
+    narrator.text += (narrator.text ? ' ' : '') + data.text;
+
+    const dur = await getAudioDuration(data.audio);
+    if (!narrator.active) return;
+    const last = narrator.sentences[narrator.sentences.length - 1];
+    if (last.duration === 0 && last.text === '') {
+        // First sentence — update the placeholder
+        last.text = data.text;
+        last.duration = dur;
+    } else {
+        narrator.sentences.push({ text: data.text, duration: dur });
+    }
+}
+
+function stopNarrateHighlight() {
+    if (narratorTimer) { clearInterval(narratorTimer); narratorTimer = null; }
+    narrator.active = false;
+    narrator.text = '';
+    narrator.words = [];
+    narrator.sentences = [{ text: '', duration: 0 }];
+    narrator.wordIdx = 0;
+    narrator.elapsed = 0;
+    clearHighlight();
+}
+
+function updateNarrateHighlight() {
+    if (!narrator.active || narrator.words.length === 0) return;
+
+    // Only accumulate elapsed time while audio is actually playing
+    const stAudio = document.getElementById('tts_audio');
+    const audioPlaying = stAudio && !stAudio.paused;
+    const now = performance.now();
+    if (audioPlaying) {
+        narrator.elapsed += now - narrator.lastTick;
+    }
+    narrator.lastTick = now;
+
+    // Calculate word index from elapsed time
+    let totalDur = 0;
+    for (const s of narrator.sentences) totalDur += s.duration;
+    if (totalDur <= 0) return;
+
+    const totalWords = narrator.words.length;
+    const wps = totalWords / totalDur; // words per second
+    const newIdx = Math.min(Math.floor(narrator.elapsed / 1000 * wps), totalWords - 1);
+
+    if (newIdx === narrator.wordIdx) return;
+    narrator.wordIdx = newIdx;
+
+    // Update marks — only change classes, don't rebuild DOM
+    const layer = document.querySelector('.ptts-highlight-layer');
+    if (!layer) return;
+    const marks = layer.querySelectorAll('mark.ptts-hl-word');
+    marks.forEach((mark, i) => {
+        if (i <= newIdx) {
+            mark.classList.add('ptts-hl-active');
+        } else {
+            mark.classList.remove('ptts-hl-active');
+        }
+    });
+
+    // Scroll active word into view
+    const activeMark = marks[newIdx];
+    if (activeMark) activeMark.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// Hook into ST's #tts_audio element for precise timing
+let stAudioEl = null;
+let stAudioListenersAttached = false;
+
+function setupStAudioListeners() {
+    const el = document.getElementById('tts_audio');
+    if (!el) return;
+    if (el === stAudioEl && stAudioListenersAttached) return;
+
+    stAudioEl = el;
+    stAudioListenersAttached = true;
+
+    // Detect user pause/stop
+    el.addEventListener('pause', () => {
+        if (narrator.active) {
+            // Check if this is a real pause (user action) vs between-chunks
+            setTimeout(() => {
+                if (narrator.active && el.paused && !isTtsProcessingLike()) {
+                    stopNarrateHighlight();
+                }
+            }, 500);
+        }
+    });
+}
+
+function isTtsProcessingLike() {
+    // Check if ST's TTS system is still processing
+    const stAudio = document.getElementById('tts_audio');
+    return stAudio && !stAudio.paused;
+}
+
+// Poll for #tts_audio element (ST creates it asynchronously)
+function pollForStAudio() {
+    setupStAudioListeners();
+    if (stAudioListenersAttached) return;
+    const id = setInterval(() => {
+        setupStAudioListeners();
+        if (stAudioListenersAttached) clearInterval(id);
+    }, 2000);
+}
+
+// Ensure highlight layer for a specific mes_text element (not just .last_mes)
+function ensureHighlightLayerFor(mesEl) {
+    if (!mesEl) return null;
+
+    // Check if already wrapped
+    if (mesEl.parentElement.classList.contains('ptts-highlight-wrap')) {
+        return mesEl.parentElement.querySelector('.ptts-highlight-layer');
+    }
+
+    const mesStyle = window.getComputedStyle(mesEl);
+    const wrap = document.createElement('div');
+    wrap.className = 'ptts-highlight-wrap';
+    wrap.style.position = 'relative';
+    wrap.style.display = mesStyle.display;
+    wrap.style.margin = mesStyle.margin;
+
+    mesEl.parentNode.insertBefore(wrap, mesEl);
+    wrap.appendChild(mesEl);
+    mesEl.style.margin = '0';
+    mesEl.style.padding = '0';
+
+    const layer = document.createElement('div');
+    layer.className = 'ptts-highlight-layer';
+    layer.style.fontFamily = mesStyle.fontFamily;
+    layer.style.fontSize = mesStyle.fontSize;
+    layer.style.fontWeight = mesStyle.fontWeight;
+    layer.style.fontStyle = mesStyle.fontStyle;
+    layer.style.lineHeight = mesStyle.lineHeight;
+    layer.style.letterSpacing = mesStyle.letterSpacing;
+    layer.style.wordSpacing = mesStyle.wordSpacing;
+    layer.style.textAlign = mesStyle.textAlign;
+    layer.style.textIndent = mesStyle.textIndent;
+    layer.style.margin = '0';
+
+    wrap.appendChild(layer);
+
+    highlightContainer = wrap;
+    highlightLayer = layer;
+    return layer;
+}
+
 window._pttsHighlightToggle = function () {
     highlightEnabled = !highlightEnabled;
     localStorage.setItem('ptts-highlight', highlightEnabled);
-    if (!highlightEnabled) clearHighlight();
+    if (!highlightEnabled) {
+        clearHighlight();
+        stopNarrateHighlight();
+    }
     return highlightEnabled;
 };
 
@@ -521,7 +787,7 @@ function onTick() {
 
     const lastId = context.chat.length - 1;
     const lastMsg = context.chat[lastId];
-    if (!lastMsg || lastMsg.is_user) return;
+    if (!lastMsg || lastMsg.is_user || lastMsg.is_system) return;
     if (!lastMsg.mes && lastMsg.mes !== '') return;
 
     // Filter full text FIRST, then diff filtered version
@@ -613,6 +879,7 @@ function enableStTts() {
 }
 
 function onProviderDropdownChange() {
+    stopNarrateHighlight();
     if (isPocketTtsActive()) {
         disableStTts();
     } else {
@@ -670,5 +937,26 @@ export function onActivate() {
 
     eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
     eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
+
+    // Narrate button highlighting — hook into ST's TTS events
+    eventSource.on(event_types.TTS_JOB_STARTED, (data) => {
+        if (!highlightEnabled) return;
+        // Don't interfere with our own periodic timer playback
+        if (adp.active) return;
+        startNarrateHighlight(data.text || '', data.messageId);
+    });
+    eventSource.on(event_types.TTS_AUDIO_READY, (data) => {
+        if (!narrator.active) return;
+        onNarrateAudioReady(data);
+    });
+    eventSource.on(event_types.TTS_JOB_COMPLETE, () => {
+        if (!narrator.active) return;
+        // Delay cleanup so last sentence's highlight is visible
+        setTimeout(() => stopNarrateHighlight(), 1500);
+    });
+
+    // Monitor ST's #tts_audio element for precise playback timing
+    pollForStAudio();
+
     console.debug('PocketTTS: Streaming active');
 }
