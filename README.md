@@ -99,6 +99,22 @@ On first generation, 2 seconds of near-silent audio plays to initialize the audi
 | First message no audio | Known SillyTavern issue with swipe regeneration in new chats. Not provider-specific. |
 | Bar not showing | Ensure TTS is enabled in SillyTavern settings. Bar visibility follows `extension_settings.tts.enabled`. |
 
+### WebSocket & Connection Issues
+
+The extension uses a persistent WebSocket connection. If you see "Disconnected" or "WebSocket connection failed" in the browser console:
+
+1. **CORS (Cross-Origin Resource Sharing)**: If SillyTavern and the PocketTTS server are on different machines or ports, the server must allow SillyTavern's origin. Ensure `pocket-tts-openapi` is started with `--cors-origins="*"` or your specific SillyTavern URL.
+2. **SSL/HTTPS vs HTTP**:
+   - If SillyTavern is running on **HTTPS**, your browser will block **ws://** (insecure) connections. You must use **wss://** and have a valid SSL certificate on the PocketTTS server (e.g., via a reverse proxy like Nginx or Caddy).
+   - If SillyTavern is on **HTTP**, use **ws://**.
+3. **Port Conflicts**: Ensure no other service is using port `8005`. You can change the port on the server with `--port 8006` and update the endpoint in SillyTavern.
+4. **Firewalls**: If running the server on a different machine, ensure port `8005` is open in the server's firewall (ufw, iptables, etc.).
+5. **Reverse Proxies**: If using Nginx/Apache as a proxy, ensure it is configured to handle WebSocket upgrades:
+   ```nginx
+   proxy_set_header Upgrade $http_upgrade;
+   proxy_set_header Connection "upgrade";
+   ```
+
 
 ## License
 

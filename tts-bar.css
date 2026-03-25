@@ -222,6 +222,6 @@ mark.ptts-hl-active {
 }
 
 .mes .mes_block {
-    overflow-wrap: auto !important;
+    overflow: auto !important;
 
 }

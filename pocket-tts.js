@@ -18,6 +18,7 @@ class PocketTtsProvider {
     _wsReady = false;
     _wsQueue = [];       // pending requests: [{text, voice, streamController, resolve, reject, timeout}]
     _wsCurrent = null;   // currently processing request
+    _reconnectAttempts = 0;
 
     // Timing from last generation (server-reported)
     lastTiming = { audio_duration: 0, gen_time: 0 };
@@ -92,11 +93,13 @@ class PocketTtsProvider {
     _updateStatus(connected) {
         const el = document.getElementById('ptts_status');
         if (!el) return;
-        const qLen = this._wsQueue.length;
+        const qLen = this._wsQueue.length + (this._wsCurrent ? 1 : 0);
         const qInfo = qLen > 0 ? ` (queue: ${qLen})` : '';
+        const recInfo = this._reconnectAttempts > 0 ? ` (reconnecting...)` : '';
+
         el.innerHTML = connected
-            ? '<span style="color:#4caf50;">●</span> Connected' + qInfo
-            : '<span style="color:#f44336;">●</span> Disconnected';
+            ? `<span style="color:#4caf50;">●</span> Connected${qInfo}`
+            : `<span style="color:#f44336;">●</span> Disconnected${qInfo}${recInfo}`;
     }
 
     _updateServerInfo(info) {
@@ -412,11 +415,15 @@ class PocketTtsProvider {
                 model: this.settings.model,
             }));
         } catch (err) {
-            clearTimeout(this._wsCurrent.timeout);
-            this._wsCurrent.reject(err);
+            console.error('PocketTTS: Reconnection failed, retrying...', err);
+            // Put it back at the front of the queue
+            this._wsQueue.unshift(this._wsCurrent);
             this._wsCurrent = null;
-            this._updateStatus(this.ready);
-            this._processQueue();
+
+            this._reconnectAttempts++;
+            const delay = Math.min(1000 * Math.pow(1.5, this._reconnectAttempts), 30000);
+            this._updateStatus(false);
+            setTimeout(() => this._processQueue(), delay);
         }
     }
 
@@ -464,15 +471,18 @@ class PocketTtsProvider {
     _onWsClose() {
         this._wsReady = false;
         if (this._wsCurrent) {
-            clearTimeout(this._wsCurrent.timeout);
-            this._wsCurrent.reject(new Error('WebSocket closed'));
+            // Put the current item back at the start of the queue to retry later
+            this._wsQueue.unshift(this._wsCurrent);
             this._wsCurrent = null;
         }
         this._updateStatus(false);
 
-        // Retry queue items if any remain
+        // Retry queue items with exponential backoff if any remain
         if (this._wsQueue.length > 0) {
-            setTimeout(() => this._processQueue(), 1000);
+            const delay = Math.min(1000 * Math.pow(1.5, this._reconnectAttempts), 30000);
+            this._reconnectAttempts++;
+            console.debug(`PocketTTS: WebSocket closed. Retrying in ${Math.round(delay)}ms...`);
+            setTimeout(() => this._processQueue(), delay);
         }
     }
 
@@ -529,6 +539,7 @@ class PocketTtsProvider {
                 console.debug('PocketTTS: WebSocket connected (persistent)');
                 this._ws = ws;
                 this._wsReady = true;
+                this._reconnectAttempts = 0; // Reset on success
                 ws.addEventListener('message', (e) => this._onWsMessage(e));
                 ws.addEventListener('close', () => this._onWsClose());
                 ws.addEventListener('error', () => {
