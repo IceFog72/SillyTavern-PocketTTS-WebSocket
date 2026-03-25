@@ -424,4 +424,149 @@ describe('PocketTtsProvider', () => {
             expect(result.genTime).toBe(1.6);
         });
     });
+
+    // ── Adaptive Streaming State ─────────────────────
+
+    describe('adaptive streaming state', () => {
+        test('adpBufferRemaining starts at 0', () => {
+            expect(provider.adpBufferRemaining).toBe(0);
+        });
+
+        test('adpGenSpeed starts at 0', () => {
+            expect(provider.adpGenSpeed).toBe(0);
+        });
+
+        test('adpPendingSentences starts at 0', () => {
+            expect(provider.adpPendingSentences).toBe(0);
+        });
+    });
+
+    // ── _calculateChunkSize ───────────────────────────
+
+    describe('_calculateChunkSize', () => {
+        test('returns MIN_CHUNK when buffer is 0', () => {
+            const result = provider._calculateChunkSize(0);
+            expect(result).toBe(50); // MIN_CHUNK
+        });
+
+        test('returns MIN_CHUNK when buffer is negative', () => {
+            const result = provider._calculateChunkSize(-1);
+            expect(result).toBe(50); // MIN_CHUNK
+        });
+
+        test('returns MAX_CHUNK when adpGenSpeed is 0', () => {
+            provider.adpGenSpeed = 0;
+            const result = provider._calculateChunkSize(5);
+            expect(result).toBe(300); // MAX_CHUNK
+        });
+
+        test('returns MIN_CHUNK when buffer ratio < 0.5', () => {
+            provider.adpGenSpeed = 2; // 2 chars/sec
+            const result = provider._calculateChunkSize(0.5);
+            expect(result).toBe(50); // MIN_CHUNK
+        });
+
+        test('returns ~125 chars when buffer ratio 0.5-1.5', () => {
+            provider.adpGenSpeed = 2; // 2 chars/sec
+            const result = provider._calculateChunkSize(2);
+            // MIN_CHUNK + (MAX - MIN) * 0.3 = 50 + 250 * 0.3 = 125
+            expect(result).toBe(125);
+        });
+
+        test('returns ~200 chars when buffer ratio 1.5-3.0', () => {
+            provider.adpGenSpeed = 2; // 2 chars/sec
+            const result = provider._calculateChunkSize(4);
+            // MIN_CHUNK + (MAX - MIN) * 0.6 = 50 + 250 * 0.6 = 200
+            expect(result).toBe(200);
+        });
+
+        test('returns MAX_CHUNK when buffer ratio >= 3.0', () => {
+            provider.adpGenSpeed = 2; // 2 chars/sec
+            const result = provider._calculateChunkSize(10);
+            expect(result).toBe(300); // MAX_CHUNK
+        });
+    });
+
+    // ── _updateGenSpeed ───────────────────────────────
+
+    describe('_updateGenSpeed', () => {
+        test('ignores zero genTime', () => {
+            provider.adpGenSpeed = 0;
+            provider._updateGenSpeed(3.0, 0);
+            expect(provider.adpGenSpeed).toBe(0);
+        });
+
+        test('ignores zero audioDuration', () => {
+            provider.adpGenSpeed = 0;
+            provider._updateGenSpeed(0, 1.5);
+            expect(provider.adpGenSpeed).toBe(0);
+        });
+
+        test('sets speed directly on first call', () => {
+            provider.adpGenSpeed = 0;
+            provider._updateGenSpeed(3.0, 1.5); // 2x real-time
+            expect(provider.adpGenSpeed).toBe(2.0);
+        });
+
+        test('uses EMA formula: alpha*current + (1-alpha)*prev', () => {
+            provider.adpGenSpeed = 2.0; // previous
+            provider._updateGenSpeed(4.0, 2.0); // current = 2.0
+            // EMA: 0.3 * 2.0 + 0.7 * 2.0 = 2.0 (no change when stable)
+            expect(provider.adpGenSpeed).toBeCloseTo(2.0, 5);
+        });
+
+        test('adjusts toward current speed with EMA', () => {
+            provider.adpGenSpeed = 2.0; // previous (slower)
+            provider._updateGenSpeed(6.0, 2.0); // current = 3.0 (faster)
+            // EMA: 0.3 * 3.0 + 0.7 * 2.0 = 0.9 + 1.4 = 2.3
+            expect(provider.adpGenSpeed).toBeCloseTo(2.3, 1);
+        });
+    });
+
+    // ── _generateSilence ─────────────────────────────
+
+    describe('_generateSilence', () => {
+        test('returns Uint8Array', () => {
+            const result = provider._generateSilence(500);
+            expect(result).toBeInstanceOf(Uint8Array);
+        });
+
+        test('creates WAV header with correct sample rate', () => {
+            const result = provider._generateSilence(500);
+            // Check RIFF header
+            expect(result[0]).toBe('R'.charCodeAt(0));
+            expect(result[1]).toBe('I'.charCodeAt(0));
+            expect(result[2]).toBe('F'.charCodeAt(0));
+            expect(result[3]).toBe('F'.charCodeAt(0));
+            // Check WAVE marker
+            expect(result[8]).toBe('W'.charCodeAt(0));
+            expect(result[9]).toBe('A'.charCodeAt(0));
+            expect(result[10]).toBe('V'.charCodeAt(0));
+            expect(result[11]).toBe('E'.charCodeAt(0));
+        });
+
+        test('generates correct duration for 500ms at 24kHz', () => {
+            const result = provider._generateSilence(500);
+            // 500ms * 24000 samples/sec / 1000 = 12000 samples
+            // data size = 12000 samples * 2 bytes = 24000 bytes
+            // Total = 44 (header) + 24000 (data) = 24044 bytes
+            expect(result.length).toBe(24044);
+        });
+
+        test('generates correct duration for 1000ms at 24kHz', () => {
+            const result = provider._generateSilence(1000);
+            // 1000ms * 24000 samples/sec / 1000 = 24000 samples
+            // Total = 44 + 48000 = 48044 bytes
+            expect(result.length).toBe(48044);
+        });
+
+        test('silence data is all zeros', () => {
+            const result = provider._generateSilence(500);
+            // Data starts at byte 44
+            for (let i = 44; i < result.length; i += 2) {
+                expect(result[i]).toBe(0);
+                expect(result[i + 1]).toBe(0);
+            }
+        });
+    });
 });

@@ -23,6 +23,11 @@ class PocketTtsProvider {
     // Timing from last generation (server-reported)
     lastTiming = { audio_duration: 0, gen_time: 0 };
 
+    // Adaptive streaming state
+    adpBufferRemaining = 0;
+    adpGenSpeed = 0;
+    adpPendingSentences = 0;
+
     static MODEL_OPTIONS = [
         { value: 'tts-1', label: 'tts-1 (Fast CPU)' },
         { value: 'tts-1-hd', label: 'tts-1-hd (Quality CPU)' },
@@ -357,9 +362,15 @@ class PocketTtsProvider {
         let resolveDone;
         const done = new Promise(r => { resolveDone = r; });
 
+        this.adpPendingSentences++;
+
         ws.onmessage = function (event) {
             if (event.data instanceof ArrayBuffer) {
                 if (streamController) streamController.enqueue(new Uint8Array(event.data));
+                // Approximate 80ms per 24kHz WAV chunk (3840 bytes); MP3 chunks are variable
+                if (self.lastTiming.audio_duration > 0) {
+                    self.adpBufferRemaining -= 0.08;
+                }
             } else {
                 try {
                     const msg = JSON.parse(event.data);
@@ -368,10 +379,16 @@ class PocketTtsProvider {
                             audio_duration: msg.audio_duration || 0,
                             gen_time: msg.gen_time || 0,
                         };
+                        self._updateGenSpeed(self.lastTiming.audio_duration, self.lastTiming.gen_time);
+                        self.adpPendingSentences = Math.max(0, self.adpPendingSentences - 1);
+                        if (self.lastTiming.audio_duration > 0) {
+                            self.adpBufferRemaining += self.lastTiming.audio_duration;
+                        }
                         if (streamController) streamController.close();
                         ws.onmessage = prevHandler;
                         resolveDone(self.lastTiming);
                     } else if (msg.status === 'error') {
+                        self.adpPendingSentences = Math.max(0, self.adpPendingSentences - 1);
                         if (streamController) streamController.error(new Error(msg.error));
                         ws.onmessage = prevHandler;
                         resolveDone({ audio_duration: 0, gen_time: 0 });
@@ -382,7 +399,10 @@ class PocketTtsProvider {
 
         const stream = new ReadableStream({
             start(controller) { streamController = controller; },
-            cancel() { ws.onmessage = prevHandler; },
+            cancel() {
+                ws.onmessage = prevHandler;
+                self.adpPendingSentences = Math.max(0, self.adpPendingSentences - 1);
+            },
         });
 
         ws.send(JSON.stringify({
@@ -393,6 +413,93 @@ class PocketTtsProvider {
         }));
 
         return { stream, done };
+    }
+
+    /**
+     * Calculate optimal chunk size based on current buffer state.
+     * @param {number} bufferRemaining - Remaining buffer time in seconds
+     * @returns {number} - Recommended characters to send
+     */
+    _calculateChunkSize(bufferRemaining) {
+        const MIN_CHUNK = 50;
+        const MAX_CHUNK = 300;
+
+        if (bufferRemaining <= 0) {
+            return MIN_CHUNK;
+        }
+
+        if (this.adpGenSpeed <= 0) {
+            return MAX_CHUNK;
+        }
+
+        const bufferRatio = bufferRemaining / this.adpGenSpeed;
+
+        if (bufferRatio < 0.5) {
+            return MIN_CHUNK;
+        } else if (bufferRatio < 1.5) {
+            return Math.round(MIN_CHUNK + (MAX_CHUNK - MIN_CHUNK) * 0.3);
+        } else if (bufferRatio < 3.0) {
+            return Math.round(MIN_CHUNK + (MAX_CHUNK - MIN_CHUNK) * 0.6);
+        } else {
+            return MAX_CHUNK;
+        }
+    }
+
+    /**
+     * Update generation speed tracking using EMA.
+     * @param {number} audioDuration - Generated audio duration in seconds
+     * @param {number} genTime - Time taken to generate in seconds
+     */
+    _updateGenSpeed(audioDuration, genTime) {
+        if (genTime <= 0 || audioDuration <= 0) return;
+
+        const currentSpeed = audioDuration / genTime;
+        const alpha = 0.3;
+
+        if (this.adpGenSpeed <= 0) {
+            this.adpGenSpeed = currentSpeed;
+        } else {
+            this.adpGenSpeed = alpha * currentSpeed + (1 - alpha) * this.adpGenSpeed;
+        }
+    }
+
+    /**
+     * Generate silence audio for buffer gaps.
+     * @param {number} durationMs - Silence duration in milliseconds
+     * @returns {Uint8Array} - WAV-encoded silence
+     */
+    _generateSilence(durationMs) {
+        const sampleRate = 24000;
+        const numSamples = Math.floor((sampleRate * durationMs) / 1000);
+        const dataSize = numSamples * 2;
+        const buffer = new ArrayBuffer(44 + dataSize);
+        const view = new DataView(buffer);
+
+        const writeString = (offset, str) => {
+            for (let i = 0; i < str.length; i++) {
+                view.setUint8(offset + i, str.charCodeAt(i));
+            }
+        };
+
+        writeString(0, 'RIFF');
+        view.setUint32(4, 36 + dataSize, true);
+        writeString(8, 'WAVE');
+        writeString(12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeString(36, 'data');
+        view.setUint32(40, dataSize, true);
+
+        for (let i = 0; i < numSamples; i++) {
+            view.setInt16(44 + i * 2, 0, true);
+        }
+
+        return new Uint8Array(buffer);
     }
 
     async _processQueue() {
@@ -433,6 +540,10 @@ class PocketTtsProvider {
         if (event.data instanceof ArrayBuffer) {
             const ctrl = this._wsCurrent.streamController();
             if (ctrl) ctrl.enqueue(new Uint8Array(event.data));
+            // Approximate 80ms per WAV chunk; track buffer drain
+            if (this.lastTiming.audio_duration > 0) {
+                this.adpBufferRemaining -= 0.08;
+            }
             return;
         }
 
@@ -446,6 +557,12 @@ class PocketTtsProvider {
                     gen_time: msg.gen_time || 0,
                 };
 
+                this._updateGenSpeed(this.lastTiming.audio_duration, this.lastTiming.gen_time);
+                this.adpPendingSentences = Math.max(0, this.adpPendingSentences - 1);
+                if (this.lastTiming.audio_duration > 0) {
+                    this.adpBufferRemaining += this.lastTiming.audio_duration;
+                }
+
                 // Close the stream — all chunks have been enqueued
                 const ctrl = this._wsCurrent.streamController();
                 if (ctrl) {
@@ -457,6 +574,7 @@ class PocketTtsProvider {
                 this._processQueue();
             } else if (msg.status === 'error') {
                 clearTimeout(this._wsCurrent.timeout);
+                this.adpPendingSentences = Math.max(0, this.adpPendingSentences - 1);
                 const ctrl = this._wsCurrent.streamController();
                 if (ctrl) {
                     try { ctrl.error(new Error(msg.error)); } catch { /* */ }
