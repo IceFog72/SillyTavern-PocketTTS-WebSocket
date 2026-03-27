@@ -649,9 +649,10 @@ function processNewText(fullText, msgId) {
 
     // Detect new message or swipe (text got shorter = content replaced)
     if (msgId !== adp.lastMsgId || fullText.length < adp.lastTextLen) {
-        // Nuke the previous message's playlist if it was different
-        if (adp.lastMsgId != null && adp.lastMsgId !== msgId) {
-            nukePlaylist(adp.lastMsgId);
+        // Only nuke on SAME-msgId swipe (text got shorter = regenerated)
+        // New message → don't nuke, old message's in-flight WS requests keep their streams
+        if (adp.lastMsgId != null && adp.lastMsgId === msgId && fullText.length < adp.lastTextLen) {
+            nukePlaylist(msgId);
         }
         adp.lastMsgId = msgId;
         adp.sentenceBuffer = '';
