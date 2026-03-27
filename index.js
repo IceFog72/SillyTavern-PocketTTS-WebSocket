@@ -1,5 +1,5 @@
 // PocketTTS — TTS extension for pocket-tts-openapi
-// Periodic timer detects streaming text, splits by sentences, sends to provider.
+// Per-message playlists. Timer reads chat[mes] after reasoning parsing.
 
 import { registerTtsProvider } from '../../tts/index.js';
 import { event_types, eventSource } from '../../../../script.js';
@@ -9,21 +9,18 @@ import { initTtsBar } from './tts-bar.js';
 
 // ─── State ─────────────────────────────────────────────────────────
 
-let adpNextSeq = 0;
-let nextPlaySeq = 0;
-let generationId = 0; // incremented on each new generation to discard stale results
-
 const adp = {
-    queue: [],
+    playlists: new Map(),   // msgId → [{url, duration, text}]
+    playOrder: [],           // [msgId, ...] in creation order
+    playingMsgId: null,      // msgId currently playing
+    playingTrack: null,      // text of track currently playing (already shifted out of queue)
     isPlaying: false,
     currentAudio: null,
-    currentStart: 0,
     timer: null,
     active: false,
     lastMsgId: null,
     lastTextLen: 0,
     sentenceBuffer: '',
-    pending: [],
 };
 
 // ─── Narrate Highlight State ───────────────────────────────────────
@@ -440,26 +437,65 @@ window._pttsHighlightToggle = function () {
 
 window._pttsHighlightEnabled = function () { return highlightEnabled; };
 
-// ─── Audio Playback ────────────────────────────────────────────────
+// ─── Per-Message Playlist Playback ─────────────────────────────────
+
+function setMesTextOverflow() {
+    const el = document.querySelector('.mes.last_mes .mes_text');
+    if (el) el.style.setProperty('overflow', 'auto', 'important');
+}
+
+function clearMesTextOverflow() {
+    const el = document.querySelector('.mes.last_mes .mes_text');
+    if (el) el.style.removeProperty('overflow');
+}
 
 function playNextInQueue() {
     if (adp.isPlaying) return;
-    const idx = adp.queue.findIndex(item => item.seqNum === nextPlaySeq);
-    if (idx === -1) return;
-    const item = adp.queue.splice(idx, 1)[0];
-    nextPlaySeq++;
+
+    // Find first msgId in playOrder that has items
+    let msgId = null;
+    let items = null;
+    for (const id of adp.playOrder) {
+        const pl = adp.playlists.get(id);
+        if (pl && pl.length > 0) {
+            msgId = id;
+            items = pl;
+            break;
+        }
+    }
+    if (!msgId || !items) {
+        clearMesTextOverflow();
+        refreshPlaylistUi();
+        return;
+    }
+
+    const item = items.shift();
     adp.isPlaying = true;
-    adp.currentStart = performance.now();
+    adp.playingMsgId = msgId;
+    adp.playingTrack = item.text;
 
+    setMesTextOverflow();
     highlightForText(item.text);
+    refreshPlaylistUi();
 
-    const audioEl = item.audio || pttsAudio;
-    if (item.url) audioEl.src = item.url;
+    const audioEl = pttsAudio;
+    audioEl.src = item.url;
 
     const cleanup = () => {
-        if (item.url) URL.revokeObjectURL(item.url);
+        URL.revokeObjectURL(item.url);
         adp.isPlaying = false;
+        adp.playingMsgId = null;
+        adp.playingTrack = null;
         clearHighlight();
+
+        // Remove empty playlist from playOrder
+        if (items.length === 0) {
+            adp.playlists.delete(msgId);
+            const idx = adp.playOrder.indexOf(msgId);
+            if (idx >= 0) adp.playOrder.splice(idx, 1);
+        }
+
+        refreshPlaylistUi();
         playNextInQueue();
     };
 
@@ -468,28 +504,107 @@ function playNextInQueue() {
     audioEl.play().catch(() => cleanup());
 }
 
+function skipTrack() {
+    if (!adp.isPlaying) return;
+    // Pause with onended intact → cleanup fires → playNextInQueue → next track in same message
+    pttsAudio.pause();
+}
+
+function nukePlaylist(msgId) {
+    if (msgId == null) return;
+
+    const items = adp.playlists.get(msgId);
+    if (items) {
+        for (const item of items) {
+            if (item.url) URL.revokeObjectURL(item.url);
+        }
+    }
+    adp.playlists.delete(msgId);
+    const idx = adp.playOrder.indexOf(msgId);
+    if (idx >= 0) adp.playOrder.splice(idx, 1);
+
+    // If currently playing this message, stop its audio and advance
+    if (adp.playingMsgId === msgId && adp.isPlaying) {
+        pttsAudio.pause();
+        pttsAudio.onended = null;
+        pttsAudio.onerror = null;
+        pttsAudio.removeAttribute('src');
+        adp.isPlaying = false;
+        adp.playingMsgId = null;
+        adp.playingTrack = null;
+        clearHighlight();
+        refreshPlaylistUi();
+        playNextInQueue();
+    } else {
+        refreshPlaylistUi();
+    }
+}
+
+function refreshPlaylistUi() {
+    window._pttsRefreshPlaylist?.();
+}
+
+function getPlaylistView() {
+    const view = [];
+    for (const msgId of adp.playOrder) {
+        const items = adp.playlists.get(msgId);
+        if (!items || items.length === 0) {
+            // Playlist might be empty but this message is currently playing
+            // (playing track was shifted out). Show just the playing track.
+            if (adp.playingMsgId === msgId && adp.isPlaying && adp.playingTrack) {
+                view.push({
+                    msgId,
+                    tracks: [{ text: adp.playingTrack, playing: true }],
+                    isPlaying: true,
+                });
+            }
+            continue;
+        }
+        const isPlaying = adp.playingMsgId === msgId && adp.isPlaying;
+        const tracks = [];
+
+        // Add the currently playing track (already shifted out of array)
+        if (isPlaying && adp.playingTrack) {
+            tracks.push({ text: adp.playingTrack, playing: true });
+        }
+
+        // Add remaining queued tracks
+        for (const i of items) {
+            tracks.push({ text: i.text, playing: false });
+        }
+
+        view.push({ msgId, tracks, isPlaying });
+    }
+    return view;
+}
+
+window._pttsGetPlaylist = getPlaylistView;
+window._pttsNukePlaylist = nukePlaylist;
+window._pttsSkipTrack = skipTrack;
+
 // ─── TTS Generation ────────────────────────────────────────────────
 
-async function adpGenerateAndPlay(text) {
-    if (!text) return;
+async function adpGenerateAndPlay(msgId, text) {
+    if (!text || msgId == null) return;
     const provider = window._pttsProvider;
     if (!provider || !provider.ready) return;
     const voiceId = getVoiceId();
-    const genId = generationId;
 
     try {
         const blobs = [];
         for await (const response of provider.generateTts(text, voiceId)) {
             blobs.push(await response.blob());
         }
-        // Discard if generation was cancelled (regenerate/stop)
-        if (genId !== generationId) return;
         const combined = new Blob(blobs, { type: blobs[0]?.type || 'audio/mpeg' });
         const url = URL.createObjectURL(combined);
         const duration = provider.lastTiming.audio_duration || (text.length / 15);
-        const seqNum = adpNextSeq++;
-        adp.queue.push({ url, duration, text, seqNum });
-        adp.queue.sort((a, b) => a.seqNum - b.seqNum);
+
+        if (!adp.playlists.has(msgId)) {
+            adp.playlists.set(msgId, []);
+            adp.playOrder.push(msgId);
+        }
+        adp.playlists.get(msgId).push({ url, duration, text });
+        refreshPlaylistUi();
         playNextInQueue();
     } catch (err) {
         console.error('PocketTTS generation error:', err);
@@ -507,6 +622,48 @@ function stopPeriodicTimer() {
     if (adp.timer) { clearInterval(adp.timer); adp.timer = null; }
 }
 
+// ─── Text Capture (timer reads chat[mes] AFTER reasoning parsing) ──
+
+function processNewText(fullText, msgId) {
+    if (!adp.active) return;
+
+    // Detect new message or swipe (text got shorter = content replaced)
+    if (msgId !== adp.lastMsgId || fullText.length < adp.lastTextLen) {
+        // Nuke the previous message's playlist if it was different
+        if (adp.lastMsgId != null && adp.lastMsgId !== msgId) {
+            nukePlaylist(adp.lastMsgId);
+        }
+        adp.lastMsgId = msgId;
+        adp.sentenceBuffer = '';
+        adp.lastTextLen = fullText.length;
+        return;
+    }
+
+    if (!fullText || fullText.length <= adp.lastTextLen) return;
+
+    const newText = fullText.substring(adp.lastTextLen);
+    adp.lastTextLen = fullText.length;
+
+    adp.sentenceBuffer += newText;
+    const { sentences, remainder } = splitSentences(adp.sentenceBuffer);
+
+    if (sentences.length > 0) {
+        adp.sentenceBuffer = remainder;
+        for (const sentence of sentences) {
+            adpGenerateAndPlay(adp.lastMsgId, sentence);
+        }
+    }
+}
+
+function onSwipe() {
+    if (!adp.active) return;
+    nukePlaylist(adp.lastMsgId);
+    adp.lastMsgId = null;
+    adp.lastTextLen = 0;
+    adp.sentenceBuffer = '';
+}
+
+// Timer reads chat[lastId].mes AFTER onProgressStreaming has processed reasoning
 function onTick() {
     if (!adp.active) return;
     const context = window.SillyTavern?.getContext?.();
@@ -517,29 +674,7 @@ function onTick() {
     if (!lastMsg || lastMsg.is_user || lastMsg.is_system) return;
     if (!lastMsg.mes && lastMsg.mes !== '') return;
 
-    // Use raw text directly — ST already filters before TTS
-    const fullText = lastMsg.mes;
-    if (!fullText || fullText.length <= adp.lastTextLen) return;
-
-    const newText = fullText.substring(adp.lastTextLen);
-    adp.lastTextLen = fullText.length;
-
-    if (lastId !== adp.lastMsgId) {
-        adp.lastMsgId = lastId;
-        adp.sentenceBuffer = '';
-        adp.pending = [];
-        lastSearchOffset = 0;
-    }
-
-    adp.sentenceBuffer += newText;
-    const { sentences, remainder } = splitSentences(adp.sentenceBuffer);
-
-    if (sentences.length > 0) {
-        adp.sentenceBuffer = remainder;
-        for (const sentence of sentences) {
-            adpGenerateAndPlay(sentence);
-        }
-    }
+    processNewText(lastMsg.mes, lastId);
 }
 
 // ─── Warmup ────────────────────────────────────────────────────────
@@ -614,31 +749,17 @@ function onGenerationStarted(generationType, _args, isDryRun) {
 
     warmupAudio();
 
-    // Invalidate all pending adpGenerateAndPlay calls
-    generationId++;
-
-    // Clear stale items from previous generation
-    for (const item of adp.queue) {
-        if (item.url) URL.revokeObjectURL(item.url);
+    // Nuke only the current message's playlist, keep others
+    if (adp.lastMsgId != null) {
+        nukePlaylist(adp.lastMsgId);
     }
-    adp.queue = [];
-    if (adp.isPlaying) {
-        if (adp.currentAudio) {
-            adp.currentAudio.pause();
-            adp.currentAudio.onended = null;
-            adp.currentAudio.onerror = null;
-            adp.currentAudio.removeAttribute('src');
-        }
-        adp.isPlaying = false;
-    }
-    adp.currentAudio = null;
 
     adp.active = true;
     adp.sentenceBuffer = '';
-    adp.pending = [];
-    adp.lastTextLen = 0;
-    adp.lastMsgId = null;
     lastSearchOffset = 0;
+    adp.lastMsgId = null;
+    adp.lastTextLen = 0;
+
     startPeriodicTimer();
 }
 
@@ -647,8 +768,8 @@ function onGenerationEnded() {
     onTick();
 
     // Flush any remaining buffered text
-    if (adp.sentenceBuffer.trim().length > 0) {
-        adpGenerateAndPlay(adp.sentenceBuffer.trim());
+    if (adp.sentenceBuffer.trim().length > 0 && adp.lastMsgId != null) {
+        adpGenerateAndPlay(adp.lastMsgId, adp.sentenceBuffer.trim());
         adp.sentenceBuffer = '';
     }
     adp.active = false;
@@ -680,6 +801,8 @@ export function onActivate() {
 
     eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
     eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
+    eventSource.on(event_types.GENERATION_STOPPED, onGenerationEnded);
+    eventSource.on(event_types.MESSAGE_SWIPED, onSwipe);
 
     eventSource.on(event_types.TTS_JOB_STARTED, (data) => {
         if (!highlightEnabled) return;

@@ -7,14 +7,18 @@ export function initTtsBar(extSettings) {
     let seeking = false;
     let speedIndex = 3; // 1.0x
     const speeds = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5];
+    let playlistVisible = false;
 
     // Bar visibility follows ST's TTS enabled state
     function updateBarVisibility() {
         const es = window.extension_settings || extSettings;
         const cb = document.getElementById('tts_enabled');
-        // Use checkbox if available, fall back to settings, default to hidden
         const on = cb ? cb.checked : (es?.tts?.enabled ?? false);
         bar.el.style.display = on ? 'flex' : 'none';
+        if (!on) {
+            bar.playlistPanel.style.display = 'none';
+            playlistVisible = false;
+        }
         const icon = bar.toggleBtn.querySelector('i');
         icon.className = on ? 'fa-solid fa-toggle-on' : 'fa-solid fa-toggle-off';
     }
@@ -51,7 +55,6 @@ export function initTtsBar(extSettings) {
     function switchTo(el) {
         if (el === audio) return;
         audio = el;
-        // Apply saved volume/speed to new element
         const savedVol = localStorage.getItem('ptts-bar-volume');
         if (savedVol !== null) audio.volume = parseFloat(savedVol);
         const savedSpeed = localStorage.getItem('ptts-bar-speed');
@@ -71,7 +74,6 @@ export function initTtsBar(extSettings) {
         if (pttsEl) bindAudio(pttsEl);
         if (stEl) bindAudio(stEl);
 
-        // Start with whichever exists
         if (!audio) {
             audio = pttsEl || stEl;
             if (audio) {
@@ -147,7 +149,6 @@ export function initTtsBar(extSettings) {
     bar.seeker.addEventListener('change', () => { seeking = false; });
 
     bar.time.addEventListener('click', () => {
-        // Toggle between elapsed and remaining
         if (!audio) return;
         const remaining = audio.duration - audio.currentTime;
         bar.time.textContent = '-' + formatTime(remaining);
@@ -179,11 +180,22 @@ export function initTtsBar(extSettings) {
         localStorage.setItem('ptts-bar-speed', speeds[speedIndex]);
     });
 
+    // Skip track — next track in SAME message
+    bar.skipBtn.addEventListener('click', () => {
+        window._pttsSkipTrack?.();
+    });
+
+    // Stop — nuke entire current message album, auto-advance to next message
     bar.stopBtn.addEventListener('click', () => {
-        if (!audio) return;
-        audio.pause();
-        audio.currentTime = 0;
-        audio.src = '';
+        const view = window._pttsGetPlaylist?.() || [];
+        const playing = view.find(v => v.isPlaying);
+        if (playing) {
+            window._pttsNukePlaylist?.(playing.msgId);
+        } else if (audio) {
+            audio.pause();
+            audio.currentTime = 0;
+            audio.src = '';
+        }
     });
 
     bar.dlBtn.addEventListener('click', () => {
@@ -210,6 +222,50 @@ export function initTtsBar(extSettings) {
     });
     updateHighlightBtn();
 
+    // ─── Playlist Panel ──────────────────────────────────
+
+    bar.playlistBtn.addEventListener('click', () => {
+        playlistVisible = !playlistVisible;
+        bar.playlistPanel.style.display = playlistVisible ? 'block' : 'none';
+        if (playlistVisible) renderPlaylist();
+    });
+
+    function renderPlaylist() {
+        if (!playlistVisible) return;
+        const view = window._pttsGetPlaylist?.() || [];
+        const panel = bar.playlistPanel;
+
+        if (view.length === 0) {
+            panel.innerHTML = '<div class="ptts-pl-empty">No tracks queued</div>';
+            return;
+        }
+
+        let html = '';
+        for (const msg of view) {
+            const msgClass = msg.isPlaying ? ' ptts-pl-msg-active' : '';
+            html += `<div class="ptts-pl-message${msgClass}">`;
+            html += `<div class="ptts-pl-header">#${msg.msgId} (${msg.tracks.length} track${msg.tracks.length > 1 ? 's' : ''})</div>`;
+
+            for (const track of msg.tracks) {
+                const trackClass = track.playing ? ' ptts-pl-track-active' : '';
+                const icon = track.playing ? '▶' : '○';
+                const preview = track.text
+                    ? track.text.substring(0, 50) + (track.text.length > 50 ? '...' : '')
+                    : '(empty)';
+                html += `<div class="ptts-pl-track${trackClass}">`;
+                html += `<span class="ptts-pl-track-icon">${icon}</span>`;
+                html += `<span class="ptts-pl-track-text">${escapeHtml(preview)}</span>`;
+                html += '</div>';
+            }
+
+            html += '</div>';
+        }
+        panel.innerHTML = html;
+    }
+
+    // Event-driven: index.js calls this when playlist changes
+    window._pttsRefreshPlaylist = renderPlaylist;
+
     console.debug('PocketTTS: Player bar initialized');
 }
 
@@ -223,7 +279,8 @@ function createBarElements() {
         <div class="ptts-controls">
             <button class="ptts-btn" id="ptts-toggle" title="TTS On/Off"><i class="fa-solid fa-toggle-on"></i></button>
             <button class="ptts-btn" id="ptts-play" title="Play/Pause"><i class="fa-solid fa-play"></i></button>
-            <button class="ptts-btn" id="ptts-stop" title="Stop"><i class="fa-solid fa-stop"></i></button>
+            <button class="ptts-btn" id="ptts-skip" title="Skip track"><i class="fa-solid fa-forward-step"></i></button>
+            <button class="ptts-btn" id="ptts-stop" title="Stop message"><i class="fa-solid fa-stop"></i></button>
             <div class="ptts-seek-wrap">
                 <span class="ptts-time" id="ptts-time" title="Click to toggle remaining">0:00 / 0:00</span>
                 <input type="range" id="ptts-seeker" min="0" max="0" step="0.1" value="0" />
@@ -234,20 +291,28 @@ function createBarElements() {
             </div>
             <span class="ptts-speed" id="ptts-speed" title="Click to change speed">1.0x</span>
             <button class="ptts-btn" id="ptts-highlight" title="Highlight playing text"><i class="fa-solid fa-highlighter"></i></button>
+            <button class="ptts-btn" id="ptts-playlist" title="Playlist"><i class="fa-solid fa-list"></i></button>
             <button class="ptts-btn" id="ptts-dl" title="Download"><i class="fa-solid fa-download"></i></button>
         </div>
     `;
 
-    // Insert before #chat
+    // Playlist panel — expands above the bar
+    const panel = document.createElement('div');
+    panel.id = 'ptts-playlist-panel';
+    panel.style.display = 'none';
+
+    // Insert panel + bar before #chat
     const chat = document.getElementById('chat');
     if (chat) {
+        chat.before(panel);
         chat.before(el);
     } else {
-        // Fallback: try form_sheld, then body
         const formSheld = document.getElementById('form_sheld');
         if (formSheld) {
+            formSheld.before(panel);
             formSheld.before(el);
         } else {
+            document.body.appendChild(panel);
             document.body.appendChild(el);
         }
     }
@@ -256,6 +321,7 @@ function createBarElements() {
         el,
         toggleBtn: el.querySelector('#ptts-toggle'),
         playBtn: el.querySelector('#ptts-play'),
+        skipBtn: el.querySelector('#ptts-skip'),
         stopBtn: el.querySelector('#ptts-stop'),
         seeker: el.querySelector('#ptts-seeker'),
         time: el.querySelector('#ptts-time'),
@@ -263,12 +329,10 @@ function createBarElements() {
         volSlider: el.querySelector('#ptts-volume'),
         speed: el.querySelector('#ptts-speed'),
         highlightBtn: el.querySelector('#ptts-highlight'),
+        playlistBtn: el.querySelector('#ptts-playlist'),
         dlBtn: el.querySelector('#ptts-dl'),
+        playlistPanel: panel,
     };
-}
-
-function injectCSS() {
-    // CSS is loaded via manifest.json — no inline injection needed
 }
 
 // ─── Helpers ──────────────────────────────────────────
@@ -282,4 +346,10 @@ function formatTime(sec) {
 
 function formatSpeed(speed) {
     return speed.toFixed(1) + 'x';
+}
+
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
 }
