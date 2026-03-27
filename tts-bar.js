@@ -247,8 +247,8 @@ export function initTtsBar(extSettings) {
             html += `<div class="ptts-pl-header">#${msg.msgId} (${msg.tracks.length} track${msg.tracks.length > 1 ? 's' : ''})</div>`;
 
             for (const track of msg.tracks) {
-                const trackClass = track.playing ? ' ptts-pl-track-active' : '';
-                const icon = track.playing ? '▶' : '○';
+                const trackClass = track.playing ? ' ptts-pl-track-active' : (track.pending ? ' ptts-pl-track-pending' : '');
+                const icon = track.playing ? '▶' : (track.pending ? '◌' : '○');
                 const preview = track.text
                     ? track.text.substring(0, 50) + (track.text.length > 50 ? '...' : '')
                     : '(empty)';

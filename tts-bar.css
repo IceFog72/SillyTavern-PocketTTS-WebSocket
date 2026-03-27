@@ -275,6 +275,11 @@ mark.ptts-hl-active {
     background-color: rgba(255, 200, 0, 0.12);
 }
 
+.ptts-pl-track-pending {
+    opacity: 0.4;
+    font-style: italic;
+}
+
 .ptts-pl-track-icon {
     width: 12px;
     text-align: center;

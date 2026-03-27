@@ -163,62 +163,52 @@ function highlightForText(playingText, msgId) {
     }
     layer.style.display = 'block';
 
-    const words = playingText.trim().split(/\s+/)
-        .map(w => w.replace(/[^\w]/g, '').toLowerCase())
-        .filter(w => w.length >= 3);
-    if (words.length === 0) return;
-
+    // Build text node map: [{node, start, end}, ...]
+    const nodes = [];
     let fullText = '';
-    const tw = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT, null, false);
-    let tn;
-    while ((tn = tw.nextNode())) fullText += tn.textContent;
-
-    const lowerText = fullText.toLowerCase();
-    const positions = [];
-    let offset = lastSearchOffset;
-    for (const word of words) {
-        const pos = lowerText.indexOf(word, offset);
-        if (pos >= 0) {
-            positions.push({ start: pos, end: pos + word.length });
-            offset = pos + word.length;
-        }
+    const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT, null, false);
+    let nd;
+    while ((nd = walker.nextNode())) {
+        const len = nd.textContent.length;
+        nodes.push({ node: nd, start: fullText.length, end: fullText.length + len });
+        fullText += nd.textContent;
     }
+    if (fullText.length === 0) return;
 
-    if (positions.length === 0) return;
-    lastSearchOffset = positions[positions.length - 1].end;
+    // Search for original playing text as substring (preserves contractions like You're, I'll)
+    const lowerFull = fullText.toLowerCase();
+    const search = playingText.trim().toLowerCase();
+    if (!search) return;
 
-    for (let wi = positions.length - 1; wi >= 0; wi--) {
-        const { start: rStart, end: rEnd } = positions[wi];
-        const nodes = [];
-        let ft = '';
-        const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT, null, false);
-        let n;
-        while ((n = walker.nextNode())) {
-            nodes.push({ node: n, start: ft.length, end: ft.length + n.textContent.length });
-            ft += n.textContent;
-        }
+    let pos = lowerFull.indexOf(search, lastSearchOffset);
+    if (pos < 0) pos = lowerFull.indexOf(search, 0);
+    if (pos < 0) return;
 
-        for (let i = nodes.length - 1; i >= 0; i--) {
-            const { node: tNode, start: ns, end: ne } = nodes[i];
-            const ws = Math.max(rStart, ns);
-            const we = Math.min(rEnd, ne);
-            if (ws >= we) continue;
+    const matchStart = pos;
+    const matchEnd = pos + search.length;
+    lastSearchOffset = matchEnd;
 
-            const ls = ws - ns;
-            const le = we - ns;
-            const nl = tNode.textContent.length;
-            if (ls >= nl || le > nl || ls < 0 || le < 0) continue;
+    // Wrap matching text nodes in <mark> — safe even across HTML element boundaries
+    for (let i = nodes.length - 1; i >= 0; i--) {
+        const { node: tNode, start: ns, end: ne } = nodes[i];
+        const ws = Math.max(matchStart, ns);
+        const we = Math.min(matchEnd, ne);
+        if (ws >= we) continue;
 
-            let target = tNode;
-            if (le < nl) target.splitText(le);
-            let wrapNode = target;
-            if (ls > 0) wrapNode = target.splitText(ls);
+        const ls = ws - ns;
+        const le = we - ns;
+        const nl = tNode.textContent.length;
+        if (ls >= nl || le > nl || ls < 0 || le < 0) continue;
 
-            const mark = document.createElement('mark');
-            mark.className = 'ptts-hl-active';
-            wrapNode.parentNode.replaceChild(mark, wrapNode);
-            mark.appendChild(wrapNode);
-        }
+        let target = tNode;
+        if (le < nl) target.splitText(le);
+        let wrapNode = target;
+        if (ls > 0) wrapNode = target.splitText(ls);
+
+        const mark = document.createElement('mark');
+        mark.className = 'ptts-hl-active';
+        wrapNode.parentNode.replaceChild(mark, wrapNode);
+        mark.appendChild(wrapNode);
     }
 
     const firstMark = layer.querySelector('.ptts-hl-active');
@@ -461,12 +451,12 @@ function clearMesTextOverflow(msgId) {
 function playNextInQueue() {
     if (adp.isPlaying) return;
 
-    // Find first msgId in playOrder that has items
+    // Find first msgId in playOrder that has playable (non-pending) items
     let msgId = null;
     let items = null;
     for (const id of adp.playOrder) {
         const pl = adp.playlists.get(id);
-        if (pl && pl.length > 0) {
+        if (pl && pl.length > 0 && !pl[0].pending) {
             msgId = id;
             items = pl;
             break;
@@ -585,7 +575,7 @@ function getPlaylistView() {
 
         // Add remaining queued tracks
         for (const i of items) {
-            tracks.push({ text: i.text, playing: false });
+            tracks.push({ text: i.text, playing: false, pending: !!i.pending });
         }
 
         view.push({ msgId, tracks, isPlaying });
@@ -605,23 +595,38 @@ async function adpGenerateAndPlay(msgId, text) {
     if (!provider || !provider.ready) return;
     const voiceId = getVoiceId();
 
+    // Add placeholder immediately (sync) — ensures correct order regardless
+    // of which async generation finishes first
+    if (!adp.playlists.has(msgId)) {
+        adp.playlists.set(msgId, []);
+        adp.playOrder.push(msgId);
+    }
+    const playlist = adp.playlists.get(msgId);
+    const placeholder = { url: null, duration: 0, text: text, pending: true };
+    playlist.push(placeholder);
+    refreshPlaylistUi();
+
     try {
         const blobs = [];
         for await (const response of provider.generateTts(text, voiceId)) {
             blobs.push(await response.blob());
         }
         const combined = new Blob(blobs, { type: blobs[0]?.type || 'audio/mpeg' });
-        const url = URL.createObjectURL(combined);
-        const duration = provider.lastTiming.audio_duration || (text.length / 15);
-
-        if (!adp.playlists.has(msgId)) {
-            adp.playlists.set(msgId, []);
-            adp.playOrder.push(msgId);
-        }
-        adp.playlists.get(msgId).push({ url, duration, text });
+        placeholder.url = URL.createObjectURL(combined);
+        placeholder.duration = provider.lastTiming.audio_duration || (text.length / 15);
+        placeholder.pending = false;
         refreshPlaylistUi();
         playNextInQueue();
     } catch (err) {
+        // Remove failed placeholder from playlist
+        const idx = playlist.indexOf(placeholder);
+        if (idx >= 0) playlist.splice(idx, 1);
+        if (playlist.length === 0) {
+            adp.playlists.delete(msgId);
+            const oi = adp.playOrder.indexOf(msgId);
+            if (oi >= 0) adp.playOrder.splice(oi, 1);
+        }
+        refreshPlaylistUi();
         console.error('PocketTTS generation error:', err);
     }
 }
