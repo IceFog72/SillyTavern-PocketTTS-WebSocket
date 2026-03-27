@@ -14,6 +14,7 @@ const adp = {
     playOrder: [],           // [msgId, ...] in creation order
     playingMsgId: null,      // msgId currently playing
     playingTrack: null,      // text of track currently playing (already shifted out of queue)
+    _lastHighlightMsgId: null, // tracks which message was last highlighted for offset reset
     isPlaying: false,
     currentAudio: null,
     timer: null,
@@ -89,8 +90,10 @@ let lastSearchOffset = 0;
 let highlightLayer = null;
 let highlightContainer = null;
 
-function ensureHighlightLayer() {
-    const mesEl = document.querySelector('.mes.last_mes .mes_text');
+function ensureHighlightLayer(msgId) {
+    const mesEl = msgId != null
+        ? document.querySelector(`.mes[mesid="${msgId}"] .mes_text`)
+        : document.querySelector('.mes.last_mes .mes_text');
     if (!mesEl) return null;
     if (mesEl.closest('.smallSysMes')) return null;
 
@@ -143,14 +146,16 @@ function clearHighlight() {
     highlightContainer = null;
 }
 
-function highlightForText(playingText) {
+function highlightForText(playingText, msgId) {
     clearHighlight();
     if (!highlightEnabled || !playingText) return;
 
-    const mesEl = document.querySelector('.mes.last_mes .mes_text');
+    const mesEl = msgId != null
+        ? document.querySelector(`.mes[mesid="${msgId}"] .mes_text`)
+        : document.querySelector('.mes.last_mes .mes_text');
     if (!mesEl) return;
 
-    const layer = ensureHighlightLayer();
+    const layer = ensureHighlightLayer(msgId);
     if (!layer) return;
 
     if (layer.innerHTML !== mesEl.innerHTML) {
@@ -439,13 +444,17 @@ window._pttsHighlightEnabled = function () { return highlightEnabled; };
 
 // ─── Per-Message Playlist Playback ─────────────────────────────────
 
-function setMesTextOverflow() {
-    const el = document.querySelector('.mes.last_mes .mes_text');
+function setMesTextOverflow(msgId) {
+    const el = msgId != null
+        ? document.querySelector(`.mes[mesid="${msgId}"] .mes_block`)
+        : document.querySelector('.mes.last_mes .mes_block');
     if (el) el.style.setProperty('overflow', 'auto', 'important');
 }
 
-function clearMesTextOverflow() {
-    const el = document.querySelector('.mes.last_mes .mes_text');
+function clearMesTextOverflow(msgId) {
+    const el = msgId != null
+        ? document.querySelector(`.mes[mesid="${msgId}"] .mes_block`)
+        : document.querySelector('.mes.last_mes .mes_block');
     if (el) el.style.removeProperty('overflow');
 }
 
@@ -464,7 +473,6 @@ function playNextInQueue() {
         }
     }
     if (!msgId || !items) {
-        clearMesTextOverflow();
         refreshPlaylistUi();
         return;
     }
@@ -474,8 +482,13 @@ function playNextInQueue() {
     adp.playingMsgId = msgId;
     adp.playingTrack = item.text;
 
-    setMesTextOverflow();
-    highlightForText(item.text);
+    setMesTextOverflow(msgId);
+    // Reset search offset when switching to a different message
+    if (adp._lastHighlightMsgId !== msgId) {
+        lastSearchOffset = 0;
+        adp._lastHighlightMsgId = msgId;
+    }
+    highlightForText(item.text, msgId);
     refreshPlaylistUi();
 
     const audioEl = pttsAudio;
@@ -487,6 +500,7 @@ function playNextInQueue() {
         adp.playingMsgId = null;
         adp.playingTrack = null;
         clearHighlight();
+        clearMesTextOverflow(msgId);
 
         // Remove empty playlist from playOrder
         if (items.length === 0) {
@@ -533,6 +547,7 @@ function nukePlaylist(msgId) {
         adp.playingMsgId = null;
         adp.playingTrack = null;
         clearHighlight();
+        clearMesTextOverflow(msgId);
         refreshPlaylistUi();
         playNextInQueue();
     } else {
@@ -692,8 +707,18 @@ function warmupAudio() {
 
 // ─── ST Integration ────────────────────────────────────────────────
 
-const ST_KEYS = ['auto_generation', 'periodic_auto_generation', 'narrate_by_paragraphs'];
-const ST_CHECKBOXES = ['tts_auto_generation', 'tts_periodic_auto_generation', 'tts_narrate_by_paragraphs'];
+const ST_KEYS = [
+    'auto_generation', 'periodic_auto_generation', 'narrate_by_paragraphs',
+    'narrate_quoted_only', 'narrate_dialogues_only', 'narrate_translated_only',
+    'skip_codeblocks', 'skip_tags', 'pass_asterisks',
+    'multi_voice_enabled', 'apply_regex',
+];
+const ST_CHECKBOXES = [
+    'tts_auto_generation', 'tts_periodic_auto_generation', 'tts_narrate_by_paragraphs',
+    'tts_narrate_quoted', 'tts_narrate_dialogues', 'tts_narrate_translated_only',
+    'tts_skip_codeblocks', 'tts_skip_tags', 'tts_pass_asterisks',
+    'tts_multi_voice_enabled', 'tts_apply_regex',
+];
 
 let stSettingsSaved = null;
 
@@ -749,8 +774,10 @@ function onGenerationStarted(generationType, _args, isDryRun) {
 
     warmupAudio();
 
-    // Nuke only the current message's playlist, keep others
-    if (adp.lastMsgId != null) {
+    // Only nuke on regenerate — old message's tracks are invalid.
+    // Normal generation: old audio keeps playing, new tracks queue after it.
+    // Swipe: handled by onSwipe via MESSAGE_SWIPED event.
+    if (generationType === 'regenerate' && adp.lastMsgId != null) {
         nukePlaylist(adp.lastMsgId);
     }
 

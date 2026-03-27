@@ -221,10 +221,6 @@ mark.ptts-hl-active {
     margin-bottom: 10px !important;
 }
 
-.mes .mes_block {
-    overflow: auto !important;
-}
-
 /* Playlist panel — expands above the bar */
 #ptts-playlist-panel {
     border: 1px solid var(--SmartThemeBorderColor);
@@ -234,7 +230,7 @@ mark.ptts-hl-active {
     padding: 4px 0;
     font-size: calc(var(--mainFontSize, 16px) * 0.8);
     color: var(--SmartThemeBodyColor);
-    max-height: 400px;
+    min-height: 200px;
     overflow-y: auto;
 }
 
