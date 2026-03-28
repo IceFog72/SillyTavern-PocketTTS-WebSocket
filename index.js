@@ -225,9 +225,17 @@ function highlightForText(playingText, msgId) {
     }
     if (fullText.length === 0) return;
 
+    // Strip markdown formatting from TTS text to match rendered DOM
+    // TTS gets `code` but DOM has <code>code</code> — backticks don't exist in DOM
+    const stripMd = (s) => s
+        .replace(/`{1,3}/g, '')  // remove backticks
+        .replace(/\*\*(.+?)\*\*/g, '$1')  // bold
+        .replace(/\*(.+?)\*/g, '$1')      // italic
+        .replace(/~~(.+?)~~/g, '$1');      // strikethrough
+
     // Search for original playing text as substring (preserves contractions like You're, I'll)
     const lowerFull = fullText.toLowerCase();
-    const search = playingText.trim().toLowerCase();
+    const search = stripMd(playingText.trim().toLowerCase());
     if (!search) return;
 
     let pos = lowerFull.indexOf(search, lastSearchOffset);
@@ -294,19 +302,26 @@ async function getAudioDuration(blobOrUrl) {
 }
 
 function buildWordHtml(text) {
+    // Strip markdown so HTML matches rendered DOM (no backticks in <code> tags)
+    const clean = text
+        .replace(/`{1,3}/g, '')
+        .replace(/\*\*(.+?)\*\*/g, '$1')
+        .replace(/\*(.+?)\*/g, '$1')
+        .replace(/~~(.+?)~~/g, '$1');
+
     const words = [];
     let html = '';
     let lastEnd = 0;
     const re = /[\w']+/g;
     let m;
-    while ((m = re.exec(text)) !== null) {
-        html += text.substring(lastEnd, m.index);
+    while ((m = re.exec(clean)) !== null) {
+        html += clean.substring(lastEnd, m.index);
         const idx = words.length;
         words.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
         html += `<mark class="ptts-hl-word" data-wi="${idx}">${m[0]}</mark>`;
         lastEnd = m.index + m[0].length;
     }
-    html += text.substring(lastEnd);
+    html += clean.substring(lastEnd);
     return { html, words };
 }
 
