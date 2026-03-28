@@ -549,6 +549,8 @@ function playNextInQueue() {
         adp.playingTrack = null;
         clearHighlight();
         clearMesTextOverflow(item.msgId);
+        // Remove played tracks for this message if no more remain
+        removePlayedMsgTracks(item.msgId, nextIdx);
         refreshPlaylistUi();
         playNextInQueue();
     };
@@ -556,6 +558,28 @@ function playNextInQueue() {
     audioEl.onended = cleanup;
     audioEl.onerror = cleanup;
     audioEl.play().catch(() => cleanup());
+}
+
+// Remove played tracks for a message when all its tracks are done
+function removePlayedMsgTracks(msgId, playedIdx) {
+    // Check if any tracks for this message remain unplayed (pending or after playedIdx)
+    const hasRemaining = adp.tracks.some((t, i) => t.msgId === msgId && (t.pending || i > playedIdx));
+    if (hasRemaining) return;
+
+    // All tracks for this message are done — remove them
+    const toRemove = new Set();
+    for (let i = 0; i < adp.tracks.length; i++) {
+        if (adp.tracks[i].msgId === msgId) {
+            if (adp.tracks[i].url) URL.revokeObjectURL(adp.tracks[i].url);
+            toRemove.add(i);
+        }
+    }
+    if (toRemove.size === 0) return;
+
+    adp.tracks = adp.tracks.filter((_, i) => !toRemove.has(i));
+    // Recalculate playingIdx
+    adp.playingIdx = -1;
+    log(`cleaned msg=${msgId}: removed ${toRemove.size} played tracks`);
 }
 
 function skipTrack() {
@@ -697,8 +721,32 @@ async function adpGenerateAndPlay(msgId, text) {
     try {
         const blobs = [];
         for await (const blobPromise of provider.generateTts(text, voiceId)) {
-            blobs.push(await blobPromise);
+            const blob = await blobPromise;
+            if (blob !== null) blobs.push(blob);
         }
+
+        // If no blobs — track was merged into another, remove placeholder
+        if (blobs.length === 0) {
+            const idx = adp.tracks.indexOf(placeholder);
+            if (idx >= 0) {
+                // Append merged text to previous track's text (for UI display)
+                if (idx > 0) {
+                    const prev = adp.tracks[idx - 1];
+                    if (prev && !prev.error) {
+                        prev.text = prev.text + ' ' + text;
+                    }
+                }
+                adp.tracks.splice(idx, 1);
+            }
+            // Adjust playingIdx if it shifted
+            if (adp.playingIdx >= 0 && idx >= 0 && idx <= adp.playingIdx) {
+                adp.playingIdx--;
+            }
+            log(`merged #${trackIdx} msg=${msgId} "${text.substring(0, 40)}"`);
+            refreshPlaylistUi();
+            return;
+        }
+
         const combined = new Blob(blobs, { type: blobs[0]?.type || 'audio/mpeg' });
 
         // Clean up old completed blob URLs to prevent memory leak

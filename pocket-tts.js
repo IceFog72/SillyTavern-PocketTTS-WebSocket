@@ -269,8 +269,12 @@ class PocketTtsProvider {
         if (buffered) {
             this._doneBuffer.delete(reqId);
             this.lastTiming = buffered.timing;
+            if (buffered.merged) {
+                // This request was merged into another — signal null
+                yield Promise.resolve(null);
+                return;
+            }
             const blob = new Blob(buffered.chunks, { type: this._getMimeType() });
-            // Resolve immediately — create a pre-resolved promise
             yield Promise.resolve(blob);
             return;
         }
@@ -396,19 +400,25 @@ class PocketTtsProvider {
                 const chunks = this._audioChunks;
                 this._audioChunks = [];
 
-                for (const rid of doneIds) {
+                for (let di = 0; di < doneIds.length; di++) {
+                    const rid = doneIds[di];
                     const idx = this._wsPending.findIndex(p => p.id === rid);
                     if (idx >= 0) {
-                        // Promise exists — resolve it
                         const p = this._wsPending.splice(idx, 1)[0];
                         clearTimeout(p.timeout);
                         this.lastTiming = timing;
-                        const blob = new Blob(chunks, { type: this._getMimeType() });
-                        p.promise._resolve(blob);
+                        // First ID in merge group gets the blob; rest get null (merged away)
+                        if (di === 0) {
+                            const blob = new Blob(chunks, { type: this._getMimeType() });
+                            p.promise._resolve(blob);
+                        } else {
+                            console.log('[tts-pl] merged: %s absorbed into %s', rid, doneIds[0]);
+                            p.promise._resolve(null);
+                        }
                     } else {
                         // Promise not created yet — buffer the response
                         console.log('[tts-pl] buffered early response for %s (%d chunks)', rid, chunks.length);
-                        this._doneBuffer.set(rid, { chunks, timing });
+                        this._doneBuffer.set(rid, { chunks: di === 0 ? chunks : [], timing, merged: di > 0 });
                         // Evict oldest entries if buffer grows too large
                         while (this._doneBuffer.size > PocketTtsProvider.MAX_DONE_BUFFER) {
                             const oldest = this._doneBuffer.keys().next().value;
