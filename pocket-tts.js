@@ -25,7 +25,8 @@ class PocketTtsProvider {
     _sendQueue = [];
     _nextReqId = 0;
 
-    lastTiming = { audio_duration: 0, gen_time: 0 };
+    static MAX_RETRIES = 3;
+    static RETRY_DELAYS = [1000, 2000, 4000];
 
     static MODEL_OPTIONS = [
         { value: 'tts-1', label: 'tts-1 (Fast CPU)' },
@@ -278,17 +279,22 @@ class PocketTtsProvider {
         blobPromise._resolve = _resolve;
         blobPromise._reject = _reject;
 
-        const pending = { id: reqId, promise: blobPromise, chunks: [] };
+        const pending = { id: reqId, promise: blobPromise, chunks: [], retryCount: 0, payload: null };
         this._wsPending.push(pending);
 
         pending.timeout = setTimeout(() => {
             const idx = this._wsPending.indexOf(pending);
-            if (idx >= 0) this._wsPending.splice(idx, 1);
+            if (idx >= 0) {
+                if (this._retryRequest(pending, 'timeout')) {
+                    return; // retry scheduled
+                }
+                this._wsPending.splice(idx, 1);
+            }
             blobPromise._reject(new Error('TTS timeout (30s)'));
         }, 30000);
 
         // Push to send queue — maintains text order
-        this._sendQueue.push({
+        const payload = {
             request_id: reqId,
             text: trimmed,
             voice: voiceId,
@@ -297,7 +303,9 @@ class PocketTtsProvider {
             temperature: this.settings.temperature,
             top_p: this.settings.top_p,
             model: this.settings.model,
-        });
+        };
+        pending.payload = payload;
+        this._sendQueue.push(payload);
 
         // Flush immediately — promise is already in _wsPending, so responses
         // can be matched. This ensures the server doesn't process the request
@@ -317,6 +325,43 @@ class PocketTtsProvider {
             const payload = this._sendQueue.shift();
             this._worker.postMessage({ type: 'send', payload });
         }
+    }
+
+    /**
+     * Retry a failed request. Resets pending state and re-sends with backoff.
+     * Returns true if retry was scheduled, false if max retries reached.
+     */
+    _retryRequest(pending, reason) {
+        if (pending.retryCount >= PocketTtsProvider.MAX_RETRIES) return false;
+
+        const delay = PocketTtsProvider.RETRY_DELAYS[pending.retryCount] || 4000;
+        pending.retryCount++;
+        pending.chunks = [];
+
+        console.log('[tts-pl] retry %d/%d for %s in %dms (%s)',
+            pending.retryCount, PocketTtsProvider.MAX_RETRIES,
+            pending.id, delay, reason);
+
+        setTimeout(() => {
+            // Re-add to pending if it was removed
+            if (!this._wsPending.includes(pending)) {
+                this._wsPending.push(pending);
+            }
+            // Reset timeout — also retry on timeout
+            clearTimeout(pending.timeout);
+            pending.timeout = setTimeout(() => {
+                const idx = this._wsPending.indexOf(pending);
+                if (this._retryRequest(pending, 'timeout')) return;
+                if (idx >= 0) this._wsPending.splice(idx, 1);
+                pending.promise._reject(new Error('TTS timeout (30s)'));
+            }, 30000);
+
+            // Re-send with retry flag
+            const retryPayload = { ...pending.payload, retry: true };
+            this._worker.postMessage({ type: 'send', payload: retryPayload });
+        }, delay);
+
+        return true;
     }
 
     // ─── Worker Message Handling ─────────────────────────────────────
@@ -379,9 +424,16 @@ class PocketTtsProvider {
                 for (const rid of errIds) {
                     const idx = this._wsPending.findIndex(p => p.id === rid);
                     if (idx >= 0) {
-                        const p = this._wsPending.splice(idx, 1)[0];
+                        const p = this._wsPending[idx];
                         clearTimeout(p.timeout);
-                        p.promise._reject(new Error(msg?.error || error || 'Unknown error'));
+                        const reason = msg?.error || error || 'Unknown error';
+                        if (this._retryRequest(p, reason)) {
+                            // Retry scheduled — keep in pending, don't reject
+                            continue;
+                        }
+                        // Max retries reached — reject
+                        this._wsPending.splice(idx, 1);
+                        p.promise._reject(new Error(reason));
                     }
                 }
                 if (!errIds.length) {
