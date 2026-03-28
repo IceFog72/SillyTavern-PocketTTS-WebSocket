@@ -247,8 +247,10 @@ export function initTtsBar(extSettings) {
             html += `<div class="ptts-pl-header">#${msg.msgId} (${msg.tracks.length} track${msg.tracks.length > 1 ? 's' : ''})</div>`;
 
             for (const track of msg.tracks) {
-                const trackClass = track.playing ? ' ptts-pl-track-active' : (track.pending ? ' ptts-pl-track-pending' : '');
-                const icon = track.playing ? '▶' : (track.pending ? '◌' : '○');
+                const trackClass = track.playing
+                    ? ' ptts-pl-track-active'
+                    : (track.error ? ' ptts-pl-track-error' : (track.pending ? ' ptts-pl-track-pending' : ''));
+                const icon = track.playing ? '▶' : (track.error ? '✕' : (track.pending ? '◌' : '○'));
                 const preview = track.text
                     ? track.text.substring(0, 50) + (track.text.length > 50 ? '...' : '')
                     : '(empty)';
@@ -266,7 +268,7 @@ export function initTtsBar(extSettings) {
     // Event-driven: index.js calls this when playlist changes
     window._pttsRefreshPlaylist = renderPlaylist;
 
-    console.debug('PocketTTS: Player bar initialized');
+    console.debug('[tts-pl] Player bar initialized');
 }
 
 // ─── DOM creation ──────────────────────────────────────

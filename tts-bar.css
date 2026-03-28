@@ -280,6 +280,12 @@ mark.ptts-hl-active {
     font-style: italic;
 }
 
+.ptts-pl-track-error {
+    opacity: 0.5;
+    text-decoration: line-through;
+    color: #f44336;
+}
+
 .ptts-pl-track-icon {
     width: 12px;
     text-align: center;

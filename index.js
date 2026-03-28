@@ -1,5 +1,23 @@
 // PocketTTS — TTS extension for pocket-tts-openapi
-// Per-message playlists. Timer reads chat[mes] after reasoning parsing.
+// Architecture: single global text buffer → flat track queue → sequential playback.
+//
+// WHY this design:
+// - One global buffer avoids interleaving audio from multiple messages.
+//   Previously each message had its own playlist → WS requests from different
+//   messages got interleaved in the queue → audio played out of order.
+// - Flat queue means WS requests go out in exact play order — no interleaving.
+// - Server merges short sentences (< 30 chars) so "Good." + "A dazed prey..."
+//   becomes one audio track instead of a tiny 0.8s track followed by a 3s track.
+//
+// Data flow:
+//   chat[mes].mes (streaming text from ST)
+//     → timer (250ms) reads new chars
+//     → processNewText() appends to textBuffer
+//     → splitSentences() on sentence boundaries (. ! ? …)
+//     → adpGenerateAndPlay() creates placeholder in tracks[], sends WS request
+//     → server generates audio (may merge short sentences)
+//     → placeholder.url filled, pending=false
+//     → playNextInQueue() plays in tracks[] order
 
 import { registerTtsProvider } from '../../tts/index.js';
 import { event_types, eventSource } from '../../../../script.js';
@@ -7,21 +25,24 @@ import { extension_settings } from '../../../extensions.js';
 import { PocketTtsProvider } from './pocket-tts.js';
 import { initTtsBar } from './tts-bar.js';
 
+// All console output prefixed [tts-pl] for easy filtering in devtools
+const log = (...args) => console.log('[tts-pl]', ...args);
+
 // ─── State ─────────────────────────────────────────────────────────
 
 const adp = {
-    playlists: new Map(),   // msgId → [{url, duration, text}]
-    playOrder: [],           // [msgId, ...] in creation order
-    playingMsgId: null,      // msgId currently playing
-    playingTrack: null,      // text of track currently playing (already shifted out of queue)
-    _lastHighlightMsgId: null, // tracks which message was last highlighted for offset reset
+    // WHY flat array: tracks are ordered by text arrival = play order.
+    // Each {url, duration, text, msgId, pending, error}.
+    // msgId tags each track so playlist UI can group by message.
+    tracks: [],
+    playingIdx: -1,        // index into tracks[] of currently playing track (-1 = none)
+    playingTrack: null,    // text of track currently playing (used for highlighting after cleanup)
     isPlaying: false,
-    currentAudio: null,
-    timer: null,
-    active: false,
-    lastMsgId: null,
-    lastTextLen: 0,
-    sentenceBuffer: '',
+    timer: null,           // 250ms interval that reads chat[mes].mes
+    active: false,         // true during generation — timer only runs when active
+    textBuffer: '',        // accumulates chars from streaming text until sentence boundary found
+    lastMsgId: null,       // current message being streamed — used to detect new message / swipe
+    lastTextLen: 0,        // how many chars of chat[mes].mes we've already processed
 };
 
 // ─── Narrate Highlight State ───────────────────────────────────────
@@ -40,12 +61,19 @@ const narrator = {
 let narratorTimer = null;
 
 // ─── Sentence Detection ────────────────────────────────────────────
+// WHY sentence-based splitting: the server generates audio per-sentence.
+// Sending a full paragraph as one request creates a long audio file that
+// can't be played until fully generated. Splitting into sentences allows
+// the first sentence to play while the second is still generating.
 
+// Matches: [sentence ending with .!?…] followed by optional closing
+// punctuation (quotes, parens, smart quotes) then whitespace.
+// The \s+ ensures we only split at actual word boundaries, not mid-word.
 const SENTENCE_END = /[.!?…][)"'\u2019\u201D\u00BB\u300D\u300F\uFF02]*\s+/g;
 
 function splitSentences(text) {
     const result = [];
-    SENTENCE_END.lastIndex = 0;
+    SENTENCE_END.lastIndex = 0; // reset regex state (global flag)
     let lastIdx = 0;
     let match;
 
@@ -56,11 +84,16 @@ function splitSentences(text) {
         lastIdx = end;
     }
 
+    // Remainder is text after the last sentence boundary — kept in buffer
+    // until more text arrives or generation ends
     const remainder = text.substring(lastIdx);
     return { sentences: result, remainder };
 }
 
 // ─── Voice Resolution ──────────────────────────────────────────────
+// WHY per-character voice mapping: different characters in ST can have
+// different TTS voices. The voice map is stored in extension settings
+// and looked up by character name.
 
 function getVoiceId() {
     const provider = window._pttsProvider;
@@ -83,13 +116,30 @@ const pttsAudio = new Audio();
 pttsAudio.id = 'ptts_audio';
 
 // ─── Sentence Highlighting ─────────────────────────────────────────
+// WHY a highlight layer: we need to highlight text in ST messages without
+// modifying the original DOM (ST may re-render it at any time). The highlight
+// layer is a semi-transparent overlay that mirrors the message text and wraps
+// matching portions in <mark> tags. The overlay sits on top of the original
+// text, creating a highlighting effect.
+//
+// WHY TreeWalker for text nodes: messages contain HTML (formatting, emphasis,
+// etc.). We need to find the character positions across HTML element boundaries.
+// TreeWalker visits each text node, and we build a map of [{node, start, end}]
+// so we can split and wrap arbitrary ranges.
+//
+// WHY substring search (not word-stripping): earlier versions stripped words
+// from the playing text and searched for them individually. This broke
+// contractions ("You're" → "youre" wouldn't match "you're" in the DOM).
+// Substring search preserves the original text, including contractions.
 
 let highlightEnabled = localStorage.getItem('ptts-highlight') === 'true';
-let lastSearchOffset = 0;
+let lastSearchOffset = 0; // search starts from last match position (sequential playback)
 
 let highlightLayer = null;
 let highlightContainer = null;
 
+// Creates or returns the highlight overlay for a message element.
+// The overlay copies font styles from the original to ensure alignment.
 function ensureHighlightLayer(msgId) {
     const mesEl = msgId != null
         ? document.querySelector(`.mes[mesid="${msgId}"] .mes_text`)
@@ -434,6 +484,9 @@ window._pttsHighlightEnabled = function () { return highlightEnabled; };
 
 // ─── Per-Message Playlist Playback ─────────────────────────────────
 
+// _lastHighlightMsgId: tracks which message was last highlighted for offset reset
+let _lastHighlightMsgId = null;
+
 function setMesTextOverflow(msgId) {
     const el = msgId != null
         ? document.querySelector(`.mes[mesid="${msgId}"] .mes_block`)
@@ -451,34 +504,40 @@ function clearMesTextOverflow(msgId) {
 function playNextInQueue() {
     if (adp.isPlaying) return;
 
-    // Find first msgId in playOrder that has playable (non-pending) items
-    let msgId = null;
-    let items = null;
-    for (const id of adp.playOrder) {
-        const pl = adp.playlists.get(id);
-        if (pl && pl.length > 0 && !pl[0].pending) {
-            msgId = id;
-            items = pl;
-            break;
+    // Skip past error tracks, find first playable
+    while (adp.playingIdx + 1 < adp.tracks.length) {
+        const next = adp.tracks[adp.playingIdx + 1];
+        if (next.error) {
+            adp.playingIdx++;
+            log(`skip error: "${next.text.substring(0, 30)}" (${next.error})`);
+            continue;
         }
+        if (next.pending) break; // wait for it
+        break;
     }
-    if (!msgId || !items) {
+
+    const nextIdx = adp.playingIdx + 1;
+    if (nextIdx >= adp.tracks.length) {
+        refreshPlaylistUi();
+        return;
+    }
+    const item = adp.tracks[nextIdx];
+    if (item.pending) {
         refreshPlaylistUi();
         return;
     }
 
-    const item = items.shift();
+    adp.playingIdx = nextIdx;
     adp.isPlaying = true;
-    adp.playingMsgId = msgId;
     adp.playingTrack = item.text;
 
-    setMesTextOverflow(msgId);
-    // Reset search offset when switching to a different message
-    if (adp._lastHighlightMsgId !== msgId) {
+    log(`play #${nextIdx} msg=${item.msgId} "${item.text.substring(0, 50)}"`);
+    setMesTextOverflow(item.msgId);
+    if (_lastHighlightMsgId !== item.msgId) {
         lastSearchOffset = 0;
-        adp._lastHighlightMsgId = msgId;
+        _lastHighlightMsgId = item.msgId;
     }
-    highlightForText(item.text, msgId);
+    highlightForText(item.text, item.msgId);
     refreshPlaylistUi();
 
     const audioEl = pttsAudio;
@@ -487,18 +546,9 @@ function playNextInQueue() {
     const cleanup = () => {
         URL.revokeObjectURL(item.url);
         adp.isPlaying = false;
-        adp.playingMsgId = null;
         adp.playingTrack = null;
         clearHighlight();
-        clearMesTextOverflow(msgId);
-
-        // Remove empty playlist from playOrder
-        if (items.length === 0) {
-            adp.playlists.delete(msgId);
-            const idx = adp.playOrder.indexOf(msgId);
-            if (idx >= 0) adp.playOrder.splice(idx, 1);
-        }
-
+        clearMesTextOverflow(item.msgId);
         refreshPlaylistUi();
         playNextInQueue();
     };
@@ -510,39 +560,79 @@ function playNextInQueue() {
 
 function skipTrack() {
     if (!adp.isPlaying) return;
-    // Pause with onended intact → cleanup fires → playNextInQueue → next track in same message
+    log('skip');
     pttsAudio.pause();
 }
 
-function nukePlaylist(msgId) {
-    if (msgId == null) return;
+function nukePlaylist() {
+    const count = adp.tracks.length;
+    log(`nuke (${count} tracks, playing=${adp.isPlaying})`);
 
-    const items = adp.playlists.get(msgId);
-    if (items) {
-        for (const item of items) {
-            if (item.url) URL.revokeObjectURL(item.url);
-        }
+    // Tell worker to clear its send queue — in-flight server requests will
+    // complete but main thread will ignore their responses (no matching promise)
+    window._pttsProvider?._worker?.postMessage({ type: 'clear' });
+
+    // Revoke all blob URLs
+    for (const t of adp.tracks) {
+        if (t.url) URL.revokeObjectURL(t.url);
     }
-    adp.playlists.delete(msgId);
-    const idx = adp.playOrder.indexOf(msgId);
-    if (idx >= 0) adp.playOrder.splice(idx, 1);
 
-    // If currently playing this message, stop its audio and advance
-    if (adp.playingMsgId === msgId && adp.isPlaying) {
+    // If currently playing, stop audio
+    if (adp.isPlaying) {
         pttsAudio.pause();
         pttsAudio.onended = null;
         pttsAudio.onerror = null;
         pttsAudio.removeAttribute('src');
         adp.isPlaying = false;
-        adp.playingMsgId = null;
         adp.playingTrack = null;
         clearHighlight();
-        clearMesTextOverflow(msgId);
-        refreshPlaylistUi();
-        playNextInQueue();
-    } else {
-        refreshPlaylistUi();
+        clearMesTextOverflow(adp.tracks[adp.playingIdx]?.msgId);
     }
+
+    adp.tracks = [];
+    adp.playingIdx = -1;
+    refreshPlaylistUi();
+}
+
+// Nuke only tracks for a specific message
+function nukeMsgTracks(msgId) {
+    const removed = adp.tracks.filter(t => t.msgId === msgId);
+    const remaining = adp.tracks.filter(t => t.msgId !== msgId);
+
+    // Revoke blob URLs for removed tracks
+    for (const t of removed) {
+        if (t.url) URL.revokeObjectURL(t.url);
+    }
+
+    // If currently playing a track from this message, stop it
+    if (adp.isPlaying && adp.playingIdx >= 0 && adp.playingIdx < adp.tracks.length) {
+        const playing = adp.tracks[adp.playingIdx];
+        if (playing && playing.msgId === msgId) {
+            pttsAudio.pause();
+            pttsAudio.onended = null;
+            pttsAudio.onerror = null;
+            pttsAudio.removeAttribute('src');
+            adp.isPlaying = false;
+            adp.playingTrack = null;
+            clearHighlight();
+            clearMesTextOverflow(msgId);
+        }
+    }
+
+    // Recalculate playingIdx in new array
+    if (adp.playingIdx >= 0 && adp.isPlaying) {
+        // Find the playing track's text in remaining
+        const playingText = adp.playingTrack;
+        adp.playingIdx = remaining.findIndex(t => t.text === playingText);
+        if (adp.playingIdx < 0) adp.playingIdx = -1;
+    } else {
+        adp.playingIdx = -1;
+    }
+
+    adp.tracks = remaining;
+    log(`nuke msg=${msgId}: removed ${removed.length}, ${remaining.length} remain`);
+    refreshPlaylistUi();
+    if (!adp.isPlaying) playNextInQueue();
 }
 
 function refreshPlaylistUi() {
@@ -551,35 +641,36 @@ function refreshPlaylistUi() {
 
 function getPlaylistView() {
     const view = [];
-    for (const msgId of adp.playOrder) {
-        const items = adp.playlists.get(msgId);
-        if (!items || items.length === 0) {
-            // Playlist might be empty but this message is currently playing
-            // (playing track was shifted out). Show just the playing track.
-            if (adp.playingMsgId === msgId && adp.isPlaying && adp.playingTrack) {
-                view.push({
-                    msgId,
-                    tracks: [{ text: adp.playingTrack, playing: true }],
-                    isPlaying: true,
-                });
-            }
-            continue;
-        }
-        const isPlaying = adp.playingMsgId === msgId && adp.isPlaying;
-        const tracks = [];
+    let currentMsg = null;
 
-        // Add the currently playing track (already shifted out of array)
-        if (isPlaying && adp.playingTrack) {
-            tracks.push({ text: adp.playingTrack, playing: true });
+    for (let i = 0; i < adp.tracks.length; i++) {
+        const t = adp.tracks[i];
+        const isPlaying = i === adp.playingIdx && adp.isPlaying;
+
+        // Start new message group
+        if (!currentMsg || currentMsg.msgId !== t.msgId) {
+            currentMsg = { msgId: t.msgId, tracks: [], isPlaying: false };
+            view.push(currentMsg);
         }
 
-        // Add remaining queued tracks
-        for (const i of items) {
-            tracks.push({ text: i.text, playing: false, pending: !!i.pending });
-        }
-
-        view.push({ msgId, tracks, isPlaying });
+        if (isPlaying) currentMsg.isPlaying = true;
+        currentMsg.tracks.push({
+            text: t.text,
+            playing: isPlaying,
+            pending: !!t.pending,
+            error: t.error || null,
+        });
     }
+
+    // If playing but track was shifted (shouldn't happen with new design), show it
+    if (adp.isPlaying && adp.playingTrack && adp.playingIdx < 0) {
+        view.unshift({
+            msgId: adp.tracks[0]?.msgId ?? '?',
+            tracks: [{ text: adp.playingTrack, playing: true, pending: false, error: null }],
+            isPlaying: true,
+        });
+    }
+
     return view;
 }
 
@@ -595,43 +686,63 @@ async function adpGenerateAndPlay(msgId, text) {
     if (!provider || !provider.ready) return;
     const voiceId = getVoiceId();
 
-    // Add placeholder immediately (sync) — ensures correct order regardless
-    // of which async generation finishes first
-    if (!adp.playlists.has(msgId)) {
-        adp.playlists.set(msgId, []);
-        adp.playOrder.push(msgId);
-    }
-    const playlist = adp.playlists.get(msgId);
-    const placeholder = { url: null, duration: 0, text: text, pending: true };
-    playlist.push(placeholder);
+    // Add placeholder immediately (sync) — ensures correct order
+    const trackIdx = adp.tracks.length;
+    const placeholder = { url: null, duration: 0, text, msgId, pending: true, error: null };
+    adp.tracks.push(placeholder);
+    log(`add #${trackIdx} msg=${msgId} "${text.substring(0, 50)}"`);
     refreshPlaylistUi();
 
     try {
         const blobs = [];
-        for await (const response of provider.generateTts(text, voiceId)) {
-            blobs.push(await response.blob());
+        for await (const blobPromise of provider.generateTts(text, voiceId)) {
+            blobs.push(await blobPromise);
         }
         const combined = new Blob(blobs, { type: blobs[0]?.type || 'audio/mpeg' });
+
+        // Clean up old completed blob URLs to prevent memory leak
+        const MAX_QUEUED_BLOBS = 10;
+        let completedCount = 0;
+        for (let i = 0; i < adp.tracks.length; i++) {
+            if (adp.tracks[i].url && !adp.tracks[i].pending && i < adp.playingIdx) {
+                completedCount++;
+            }
+        }
+        if (completedCount > MAX_QUEUED_BLOBS) {
+            for (let i = 0; i < adp.playingIdx; i++) {
+                if (adp.tracks[i].url) {
+                    URL.revokeObjectURL(adp.tracks[i].url);
+                    adp.tracks[i].url = null;
+                }
+            }
+        }
+
         placeholder.url = URL.createObjectURL(combined);
         placeholder.duration = provider.lastTiming.audio_duration || (text.length / 15);
         placeholder.pending = false;
+
+        // Check for out-of-order: earlier track still pending?
+        for (let i = 0; i < trackIdx; i++) {
+            if (adp.tracks[i]?.pending) {
+                log(`⚠️  OUT OF ORDER: #${trackIdx} done but #${i} still pending! ("${adp.tracks[i].text.substring(0, 40)}")`);
+            }
+        }
+
+        log(`done #${trackIdx} msg=${msgId} ${placeholder.duration.toFixed(1)}s "${text.substring(0, 40)}"`);
         refreshPlaylistUi();
         playNextInQueue();
     } catch (err) {
-        // Remove failed placeholder from playlist
-        const idx = playlist.indexOf(placeholder);
-        if (idx >= 0) playlist.splice(idx, 1);
-        if (playlist.length === 0) {
-            adp.playlists.delete(msgId);
-            const oi = adp.playOrder.indexOf(msgId);
-            if (oi >= 0) adp.playOrder.splice(oi, 1);
-        }
+        placeholder.pending = false;
+        placeholder.error = err.message;
+        log(`err  #${trackIdx} msg=${msgId} ${err.message}`);
         refreshPlaylistUi();
-        console.error('PocketTTS generation error:', err);
+        playNextInQueue();
     }
 }
 
-// ─── Periodic Timer ────────────────────────────────────────────────
+// ─── Text Capture (global buffer → flat queue) ─────────────────────
+// Timer reads chat[mes] AFTER reasoning parsing (chat[lastId].mes is set
+// by onProgressStreaming after #autoParseReasoningFromMessage runs).
 
 function startPeriodicTimer() {
     stopPeriodicTimer();
@@ -642,34 +753,48 @@ function stopPeriodicTimer() {
     if (adp.timer) { clearInterval(adp.timer); adp.timer = null; }
 }
 
-// ─── Text Capture (timer reads chat[mes] AFTER reasoning parsing) ──
+// Flush any remaining text in the global buffer as a track
+function flushBuffer() {
+    const text = adp.textBuffer.trim();
+    if (text.length > 0 && adp.lastMsgId != null) {
+        adpGenerateAndPlay(adp.lastMsgId, text);
+        adp.textBuffer = '';
+    }
+}
 
 function processNewText(fullText, msgId) {
     if (!adp.active) return;
 
-    // Detect new message or swipe (text got shorter = content replaced)
-    if (msgId !== adp.lastMsgId || fullText.length < adp.lastTextLen) {
-        // Only nuke on SAME-msgId swipe (text got shorter = regenerated)
-        // New message → don't nuke, old message's in-flight WS requests keep their streams
-        if (adp.lastMsgId != null && adp.lastMsgId === msgId && fullText.length < adp.lastTextLen) {
-            nukePlaylist(msgId);
+    // New message detected (msgId changed)
+    if (msgId !== adp.lastMsgId) {
+        if (adp.lastMsgId != null) {
+            log(`new msg=${msgId} (prev=${adp.lastMsgId})`);
+            flushBuffer();
         }
         adp.lastMsgId = msgId;
-        adp.sentenceBuffer = '';
-        adp.lastTextLen = fullText.length;
-        return;
+        adp.lastTextLen = 0;
+        adp.textBuffer = '';
+    }
+
+    // Swipe detected (text got shorter = regenerated)
+    if (fullText.length < adp.lastTextLen) {
+        log(`swipe msg=${msgId}`);
+        nukeMsgTracks(msgId);
+        adp.lastTextLen = 0;
+        adp.textBuffer = '';
     }
 
     if (!fullText || fullText.length <= adp.lastTextLen) return;
 
+    // Append new text to global buffer
     const newText = fullText.substring(adp.lastTextLen);
     adp.lastTextLen = fullText.length;
+    adp.textBuffer += newText;
 
-    adp.sentenceBuffer += newText;
-    const { sentences, remainder } = splitSentences(adp.sentenceBuffer);
-
+    // Split sentences and push to queue — server merges short ones
+    const { sentences, remainder } = splitSentences(adp.textBuffer);
     if (sentences.length > 0) {
-        adp.sentenceBuffer = remainder;
+        adp.textBuffer = remainder;
         for (const sentence of sentences) {
             adpGenerateAndPlay(adp.lastMsgId, sentence);
         }
@@ -678,13 +803,13 @@ function processNewText(fullText, msgId) {
 
 function onSwipe() {
     if (!adp.active) return;
-    nukePlaylist(adp.lastMsgId);
+    log('swipe event');
+    nukeMsgTracks(adp.lastMsgId);
     adp.lastMsgId = null;
     adp.lastTextLen = 0;
-    adp.sentenceBuffer = '';
+    adp.textBuffer = '';
 }
 
-// Timer reads chat[lastId].mes AFTER onProgressStreaming has processed reasoning
 function onTick() {
     if (!adp.active) return;
     const context = window.SillyTavern?.getContext?.();
@@ -778,17 +903,15 @@ function onGenerationStarted(generationType, _args, isDryRun) {
     if (!isPocketTtsActive()) return;
     if (isDryRun) return;
 
+    log(`gen start type=${generationType}`);
     warmupAudio();
 
-    // Only nuke on regenerate — old message's tracks are invalid.
-    // Normal generation: old audio keeps playing, new tracks queue after it.
-    // Swipe: handled by onSwipe via MESSAGE_SWIPED event.
-    if (generationType === 'regenerate' && adp.lastMsgId != null) {
-        nukePlaylist(adp.lastMsgId);
+    if (generationType === 'regenerate') {
+        nukePlaylist();
     }
 
     adp.active = true;
-    adp.sentenceBuffer = '';
+    adp.textBuffer = '';
     lastSearchOffset = 0;
     adp.lastMsgId = null;
     adp.lastTextLen = 0;
@@ -797,13 +920,12 @@ function onGenerationStarted(generationType, _args, isDryRun) {
 }
 
 function onGenerationEnded() {
-    // Final text capture before flush — timer may have missed the last chunk
     onTick();
-
-    // Flush any remaining buffered text
-    if (adp.sentenceBuffer.trim().length > 0 && adp.lastMsgId != null) {
-        adpGenerateAndPlay(adp.lastMsgId, adp.sentenceBuffer.trim());
-        adp.sentenceBuffer = '';
+    if (adp.textBuffer.trim().length > 0) {
+        log('gen end flush');
+        flushBuffer();
+    } else {
+        log('gen end');
     }
     adp.active = false;
     stopPeriodicTimer();

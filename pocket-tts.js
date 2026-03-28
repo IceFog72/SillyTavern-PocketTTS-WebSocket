@@ -1,5 +1,5 @@
 // pocket-tts.js — SillyTavern TTS Provider for pocket-tts-openapi
-// Persistent WebSocket with sequential request queue for ordered audio delivery.
+// Web Worker for WS connection (survives main thread blocking by LLM streaming).
 
 import { saveTtsProviderSettings, getPreviewString } from '../../tts/index.js';
 
@@ -13,11 +13,17 @@ class PocketTtsProvider {
 
     audioElement = document.createElement('audio');
 
-    _ws = null;
-    _wsReady = false;
-    _wsQueue = [];
-    _wsCurrent = null;
-    _reconnectAttempts = 0;
+    _worker = null;
+    _workerReady = false;
+    // Main thread: tracks promises by request_id — resolved when audio arrives
+    _wsPending = [];
+    // Buffer for responses that arrive before their promises are created
+    // (server processes faster than client creates promises)
+    _doneBuffer = new Map();  // request_id → {chunks, timing}
+    // Send queue: ensures text goes to server in order (sequential IDs)
+    // Sends fire-and-forget — doesn't wait for response
+    _sendQueue = [];
+    _nextReqId = 0;
 
     lastTiming = { audio_duration: 0, gen_time: 0 };
 
@@ -91,8 +97,8 @@ class PocketTtsProvider {
     _updateStatus(connected) {
         const el = document.getElementById('ptts_status');
         if (!el) return;
-        const qLen = this._wsQueue.length + (this._wsCurrent ? 1 : 0);
-        const qInfo = qLen > 0 ? ` (queue: ${qLen})` : '';
+        const pending = this._wsPending.length;
+        const qInfo = pending > 0 ? ` (${pending} pending)` : '';
 
         el.innerHTML = connected
             ? `<span style="color:#4caf50;">●</span> Connected${qInfo}`
@@ -127,7 +133,8 @@ class PocketTtsProvider {
         $('#ptts_top_p_val').text(this.settings.top_p);
 
         if (this.settings.provider_endpoint !== oldEndpoint) {
-            this._disconnectWs();
+            this._closeWorker();
+            this._initWorker();
             this.checkReady().then(() => this._updateStatus(this.ready));
         }
         saveTtsProviderSettings();
@@ -159,6 +166,7 @@ class PocketTtsProvider {
         $('#ptts_top_p').on('input', () => this.onSettingsChange());
 
         window._pttsProvider = this;
+        this._initWorker();
         await this._loadVoices();
         await this.checkReady();
         this._updateStatus(this.ready);
@@ -234,171 +242,178 @@ class PocketTtsProvider {
     // ─── TTS Generation ─────────────────────────────────────────────
 
     /**
-     * Split text into sentences, merge short ones, send each via WS queue.
-     * Yields one Response per sentence. Queue guarantees ordering.
+     * Generate TTS audio. Yields one Promise<Blob> per text part.
+     *
+     * WHY this design: text goes into a send queue that ensures ordering
+     * (sequential IDs = text order). The queue sends to the worker one at
+     * a time, but does NOT wait for the response — fire-and-forget. The
+     * server processes sequentially and sends audio back when ready.
+     * Audio is received independently and matched to promises by request_id.
+     *
+     * The queue exists for ORDERING, not for waiting. All text from all
+     * messages goes through this single queue, ensuring correct text order
+     * regardless of which message it came from.
      */
     async *generateTts(text, voiceId) {
-        const MIN_LEN = 20;
-        const raw = text.match(/[^.!?…]+[.!?…]+|[^.!?…]+/g) || [text];
-        const parts = [];
-        let buf = '';
+        const trimmed = text.trim();
+        if (!trimmed) return;
 
-        for (const s of raw) {
-            const trimmed = s.trim();
-            if (!trimmed) continue;
-            if (buf.length > 0 && buf.length < MIN_LEN) {
-                buf += ' ' + trimmed;
-            } else if (buf.length > 0) {
-                parts.push(buf);
-                buf = trimmed;
-            } else {
-                buf = trimmed;
-            }
-        }
-        if (buf) parts.push(buf);
+        const reqId = 'r' + (this._nextReqId++);
 
-        for (let i = parts.length - 1; i > 0; i--) {
-            if (parts[i].length < MIN_LEN) {
-                parts[i - 1] += ' ' + parts[i];
-                parts.splice(i, 1);
-            }
-        }
-
-        for (const part of parts) {
-            const trimmed = part.trim();
-            if (!trimmed) continue;
-
-            const response = await new Promise((resolve) => {
-                let streamController;
-                const stream = new ReadableStream({
-                    start(ctrl) { streamController = ctrl; },
-                });
-
-                const req = {
-                    text: trimmed,
-                    voice: voiceId,
-                    streamController: () => streamController,
-                    resolve,
-                    reject: () => {},
-                };
-
-                req.timeout = setTimeout(() => {
-                    const idx = this._wsQueue.indexOf(req);
-                    if (idx >= 0) this._wsQueue.splice(idx, 1);
-                    if (this._wsCurrent === req) this._wsCurrent = null;
-                    try { streamController.error(new Error('TTS timeout')); } catch { /* */ }
-                    this._updateStatus(this.ready);
-                }, 120000);
-
-                this._wsQueue.push(req);
-                this._updateStatus(this.ready);
-                this._processQueue();
-
-                resolve(new Response(stream, { headers: { 'Content-Type': this._getMimeType() } }));
-            });
-
-            yield response;
-        }
-    }
-
-    // ─── Queue Processing ───────────────────────────────────────────
-
-    async _processQueue() {
-        if (this._wsCurrent) return;
-        if (this._wsQueue.length === 0) return;
-
-        this._wsCurrent = this._wsQueue.shift();
-        this._updateStatus(this.ready);
-
-        try {
-            const ws = await this._ensureWs();
-            ws.send(JSON.stringify({
-                text: this._wsCurrent.text,
-                voice: this._wsCurrent.voice,
-                format: this.settings.format,
-                speed: this.settings.speed,
-                temperature: this.settings.temperature,
-                top_p: this.settings.top_p,
-                model: this.settings.model,
-            }));
-        } catch (err) {
-            this._wsQueue.unshift(this._wsCurrent);
-            this._wsCurrent = null;
-            this._reconnectAttempts++;
-            const delay = Math.min(1000 * Math.pow(1.5, this._reconnectAttempts), 30000);
-            this._updateStatus(false);
-            setTimeout(() => this._processQueue(), delay);
-        }
-    }
-
-    _onWsMessage(event) {
-        if (!this._wsCurrent) return;
-
-        if (event.data instanceof ArrayBuffer) {
-            const ctrl = this._wsCurrent.streamController();
-            if (ctrl) ctrl.enqueue(new Uint8Array(event.data));
+        // Check if response already arrived (server processed before promise created)
+        // This happens when the server is fast and the client is slow (blocked by LLM)
+        const buffered = this._doneBuffer.get(reqId);
+        if (buffered) {
+            this._doneBuffer.delete(reqId);
+            this.lastTiming = buffered.timing;
+            const blob = new Blob(buffered.chunks, { type: this._getMimeType() });
+            // Resolve immediately — create a pre-resolved promise
+            yield Promise.resolve(blob);
             return;
         }
 
-        try {
-            const msg = JSON.parse(event.data);
+        // Create promise — resolved when audio arrives with matching request_id
+        let _resolve, _reject;
+        const blobPromise = new Promise((res, rej) => { _resolve = res; _reject = rej; });
+        blobPromise._resolve = _resolve;
+        blobPromise._reject = _reject;
+
+        const pending = { id: reqId, promise: blobPromise, chunks: [] };
+        this._wsPending.push(pending);
+
+        pending.timeout = setTimeout(() => {
+            const idx = this._wsPending.indexOf(pending);
+            if (idx >= 0) this._wsPending.splice(idx, 1);
+            blobPromise._reject(new Error('TTS timeout (30s)'));
+        }, 30000);
+
+        // Push to send queue — maintains text order
+        this._sendQueue.push({
+            request_id: reqId,
+            text: trimmed,
+            voice: voiceId,
+            format: this.settings.format,
+            speed: this.settings.speed,
+            temperature: this.settings.temperature,
+            top_p: this.settings.top_p,
+            model: this.settings.model,
+        });
+
+        // Flush immediately — promise is already in _wsPending, so responses
+        // can be matched. This ensures the server doesn't process the request
+        // before the promise exists.
+        this._flushSendQueue();
+
+        yield blobPromise;
+    }
+
+    /**
+     * Send queued requests to worker in order.
+     * Fire-and-forget: sends all queued items, doesn't wait for responses.
+     * Called after each generateTts push and after each done/error received.
+     */
+    _flushSendQueue() {
+        while (this._sendQueue.length > 0) {
+            const payload = this._sendQueue.shift();
+            this._worker.postMessage({ type: 'send', payload });
+        }
+    }
+
+    // ─── Worker Message Handling ─────────────────────────────────────
+
+    _onWorkerMessage(event) {
+        const { type, data, msg, error, connected, requestId } = event.data;
+
+        if (type === 'status') {
+            this._workerReady = connected;
+            this._updateStatus(this.ready);
+            return;
+        }
+
+        if (type === 'audio') {
+            // Audio chunk from server — accumulate in the earliest pending request
+            // (server processes sequentially, so audio always belongs to the first pending)
+            if (this._wsPending.length > 0) {
+                this._wsPending[0].chunks.push(new Uint8Array(data));
+            }
+            return;
+        }
+
+        if (type === 'json') {
             if (msg.status === 'done') {
-                clearTimeout(this._wsCurrent.timeout);
-                this.lastTiming = {
+                const doneIds = Array.isArray(msg.request_id) ? msg.request_id : [msg.request_id];
+                const timing = {
                     audio_duration: msg.audio_duration || 0,
                     gen_time: msg.gen_time || 0,
                 };
-                const ctrl = this._wsCurrent.streamController();
-                if (ctrl) { try { ctrl.close(); } catch { /* */ } }
-                this._wsCurrent = null;
+
+                for (const rid of doneIds) {
+                    const idx = this._wsPending.findIndex(p => p.id === rid);
+                    if (idx >= 0) {
+                        // Promise exists — resolve it
+                        const p = this._wsPending.splice(idx, 1)[0];
+                        clearTimeout(p.timeout);
+                        this.lastTiming = timing;
+                        const blob = new Blob(p.chunks, { type: this._getMimeType() });
+                        p.promise._resolve(blob);
+                    } else {
+                        // Promise not created yet — buffer the response
+                        // Server processed faster than client could create the promise
+                        // (happens when main thread is blocked by LLM processing)
+                        console.log('[tts-pl] buffered early response for %s', rid);
+                        this._doneBuffer.set(rid, {
+                            chunks: this._wsPending.length > 0 ? [...this._wsPending[0].chunks] : [],
+                            timing,
+                        });
+                    }
+                }
                 this._updateStatus(this.ready);
-                this._processQueue();
-            } else if (msg.status === 'error') {
-                clearTimeout(this._wsCurrent.timeout);
-                const ctrl = this._wsCurrent.streamController();
-                if (ctrl) { try { ctrl.error(new Error(msg.error)); } catch { /* */ } }
-                this._wsCurrent = null;
-                this._updateStatus(this.ready);
-                this._processQueue();
-            }
-        } catch { /* ignore non-JSON */ }
-    }
-
-    _onWsClose() {
-        this._wsReady = false;
-        if (this._wsCurrent) {
-            this._wsQueue.unshift(this._wsCurrent);
-            this._wsCurrent = null;
-        }
-        this._updateStatus(false);
-        if (this._wsQueue.length > 0) {
-            const delay = Math.min(1000 * Math.pow(1.5, this._reconnectAttempts), 30000);
-            this._reconnectAttempts++;
-            setTimeout(() => this._processQueue(), delay);
-        }
-    }
-
-    // ─── Preview ───────────────────────────────────────────────────
-
-    async previewTtsVoice(voiceId) {
-        this.audioElement.pause();
-        this.audioElement.currentTime = 0;
-        const text = getPreviewString('en-US');
-        try {
-            for await (const response of this.generateTts(text, voiceId)) {
-                const blob = await response.blob();
-                const url = URL.createObjectURL(blob);
-                this.audioElement.src = url;
-                this.audioElement.play();
-                this.audioElement.onended = () => URL.revokeObjectURL(url);
                 return;
             }
-        } catch (err) {
-            console.error('PocketTTS preview error:', err);
+
+            if (msg.status === 'error') {
+                const errIds = msg?.request_id
+                    ? (Array.isArray(msg.request_id) ? msg.request_id : [msg.request_id])
+                    : (requestId ? [requestId] : []);
+
+                for (const rid of errIds) {
+                    const idx = this._wsPending.findIndex(p => p.id === rid);
+                    if (idx >= 0) {
+                        const p = this._wsPending.splice(idx, 1)[0];
+                        clearTimeout(p.timeout);
+                        p.promise._reject(new Error(msg?.error || error || 'Unknown error'));
+                    }
+                }
+                if (!errIds.length) {
+                    console.log('[tts-pl] worker error:', error || msg?.error);
+                }
+                this._updateStatus(this.ready);
+                return;
+            }
+
+            // Other JSON — ignore
+            return;
         }
     }
 
-    // ─── WebSocket Connection ───────────────────────────────────────
+    // ─── Worker Lifecycle ───────────────────────────────────────────
+
+    _initWorker() {
+        if (this._worker) return;
+        const workerUrl = new URL('./ws-worker.js', import.meta.url);
+        this._worker = new Worker(workerUrl);
+        this._worker.onmessage = (e) => this._onWorkerMessage(e);
+        this._worker.postMessage({ type: 'init', url: this._getWsUrl() });
+    }
+
+    _closeWorker() {
+        if (this._worker) {
+            this._worker.postMessage({ type: 'close' });
+            this._worker.terminate();
+            this._worker = null;
+            this._workerReady = false;
+        }
+    }
 
     _getWsUrl() {
         let ep = this.settings.provider_endpoint.replace(/\/$/, '');
@@ -406,53 +421,6 @@ class PocketTtsProvider {
         else if (ep.startsWith('https://')) ep = ep.replace('https://', 'wss://');
         if (!ep.startsWith('ws://') && !ep.startsWith('wss://')) ep = 'ws://' + ep;
         return ep + '/v1/audio/stream';
-    }
-
-    async _ensureWs() {
-        if (this._ws && this._ws.readyState === WebSocket.OPEN && this._wsReady) {
-            return this._ws;
-        }
-        this._disconnectWs();
-
-        return new Promise((resolve, reject) => {
-            const ws = new WebSocket(this._getWsUrl());
-            ws.binaryType = 'arraybuffer';
-
-            const timer = setTimeout(() => {
-                ws.removeEventListener('open', onOpen);
-                ws.removeEventListener('error', onErr);
-                try { ws.close(); } catch { /* */ }
-                reject(new Error('WebSocket connection timeout'));
-            }, 10000);
-
-            const onOpen = () => {
-                clearTimeout(timer);
-                ws.removeEventListener('error', onErr);
-                this._ws = ws;
-                this._wsReady = true;
-                this._reconnectAttempts = 0;
-                ws.addEventListener('message', (e) => this._onWsMessage(e));
-                ws.addEventListener('close', () => this._onWsClose());
-                resolve(ws);
-            };
-
-            const onErr = () => {
-                clearTimeout(timer);
-                ws.removeEventListener('open', onOpen);
-                reject(new Error('WebSocket connection failed'));
-            };
-
-            ws.addEventListener('open', onOpen);
-            ws.addEventListener('error', onErr);
-        });
-    }
-
-    _disconnectWs() {
-        this._wsReady = false;
-        if (this._ws) {
-            try { this._ws.close(); } catch { /* */ }
-            this._ws = null;
-        }
     }
 
     _getMimeType() {
@@ -465,17 +433,31 @@ class PocketTtsProvider {
         }
     }
 
+    // ─── Preview ───────────────────────────────────────────────────
+
+    async previewTtsVoice(voiceId) {
+        this.audioElement.pause();
+        this.audioElement.currentTime = 0;
+        const text = getPreviewString('en-US');
+        try {
+            for await (const blobPromise of this.generateTts(text, voiceId)) {
+                const blob = await blobPromise;
+                const url = URL.createObjectURL(blob);
+                this.audioElement.src = url;
+                this.audioElement.play();
+                this.audioElement.onended = () => URL.revokeObjectURL(url);
+                return;
+            }
+        } catch (err) {
+            console.error('[tts-pl] preview error:', err);
+        }
+    }
+
     // ─── Cleanup ───────────────────────────────────────────────────
 
     dispose() {
-        for (const req of this._wsQueue) {
-            clearTimeout(req.timeout);
-        }
-        this._wsQueue = [];
-        if (this._wsCurrent) {
-            clearTimeout(this._wsCurrent.timeout);
-            this._wsCurrent = null;
-        }
-        this._disconnectWs();
+        for (const p of this._wsPending) clearTimeout(p.timeout);
+        this._wsPending = [];
+        this._closeWorker();
     }
 }
