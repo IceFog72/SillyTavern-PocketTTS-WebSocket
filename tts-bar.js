@@ -141,6 +141,7 @@ export function initTtsBar(extSettings) {
     });
 
     bar.seeker.addEventListener('input', () => {
+        if (!audio) return;
         seeking = true;
         audio.currentTime = parseFloat(bar.seeker.value);
         bar.time.textContent = formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
@@ -185,12 +186,12 @@ export function initTtsBar(extSettings) {
         window._pttsSkipTrack?.();
     });
 
-    // Stop — nuke entire current message album, auto-advance to next message
+    // Stop — nuke current message album only
     bar.stopBtn.addEventListener('click', () => {
         const view = window._pttsGetPlaylist?.() || [];
         const playing = view.find(v => v.isPlaying);
         if (playing) {
-            window._pttsNukePlaylist?.(playing.msgId);
+            window._pttsNukeMsgTracks?.(playing.msgId);
         } else if (audio) {
             audio.pause();
             audio.currentTime = 0;
@@ -200,9 +201,11 @@ export function initTtsBar(extSettings) {
 
     bar.dlBtn.addEventListener('click', () => {
         if (!audio || !audio.src) return;
+        const es = window.extension_settings || extSettings;
+        const fmt = es?.tts?.PocketTTS?.format || 'mp3';
         const a = document.createElement('a');
         a.href = audio.src;
-        a.download = 'tts-audio.mp3';
+        a.download = 'tts-audio.' + fmt;
         a.click();
     });
 

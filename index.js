@@ -676,6 +676,7 @@ function getPlaylistView() {
 
 window._pttsGetPlaylist = getPlaylistView;
 window._pttsNukePlaylist = nukePlaylist;
+window._pttsNukeMsgTracks = nukeMsgTracks;
 window._pttsSkipTrack = skipTrack;
 
 // ─── TTS Generation ────────────────────────────────────────────────
@@ -974,4 +975,10 @@ export function onActivate() {
     });
 
     pollForStAudio();
+
+    // Clean up on page unload — revoke blob URLs, stop provider
+    window.addEventListener('beforeunload', () => {
+        nukePlaylist();
+        window._pttsProvider?.dispose();
+    });
 }

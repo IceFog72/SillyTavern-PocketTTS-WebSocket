@@ -18,8 +18,10 @@ class PocketTtsProvider {
     // Main thread: tracks promises by request_id — resolved when audio arrives
     _wsPending = [];
     // Buffer for responses that arrive before their promises are created
-    // (server processes faster than client creates promises)
     _doneBuffer = new Map();  // request_id → {chunks, timing}
+    static MAX_DONE_BUFFER = 10; // limit to prevent memory leak
+    // Raw audio chunk buffer — accumulated between requests, claimed on 'done'
+    _audioChunks = [];
     // Send queue: ensures text goes to server in order (sequential IDs)
     // Sends fire-and-forget — doesn't wait for response
     _sendQueue = [];
@@ -285,6 +287,7 @@ class PocketTtsProvider {
         pending.timeout = setTimeout(() => {
             const idx = this._wsPending.indexOf(pending);
             if (idx >= 0) {
+                this._audioChunks = []; // discard orphaned chunks from timed-out request
                 if (this._retryRequest(pending, 'timeout')) {
                     return; // retry scheduled
                 }
@@ -376,11 +379,8 @@ class PocketTtsProvider {
         }
 
         if (type === 'audio') {
-            // Audio chunk from server — accumulate in the earliest pending request
-            // (server processes sequentially, so audio always belongs to the first pending)
-            if (this._wsPending.length > 0) {
-                this._wsPending[0].chunks.push(new Uint8Array(data));
-            }
+            // Accumulate raw chunks — they'll be associated with a request ID on 'done'
+            this._audioChunks.push(new Uint8Array(data));
             return;
         }
 
@@ -392,6 +392,10 @@ class PocketTtsProvider {
                     gen_time: msg.gen_time || 0,
                 };
 
+                // Claim the accumulated audio chunks for this request, then reset buffer
+                const chunks = this._audioChunks;
+                this._audioChunks = [];
+
                 for (const rid of doneIds) {
                     const idx = this._wsPending.findIndex(p => p.id === rid);
                     if (idx >= 0) {
@@ -399,17 +403,17 @@ class PocketTtsProvider {
                         const p = this._wsPending.splice(idx, 1)[0];
                         clearTimeout(p.timeout);
                         this.lastTiming = timing;
-                        const blob = new Blob(p.chunks, { type: this._getMimeType() });
+                        const blob = new Blob(chunks, { type: this._getMimeType() });
                         p.promise._resolve(blob);
                     } else {
                         // Promise not created yet — buffer the response
-                        // Server processed faster than client could create the promise
-                        // (happens when main thread is blocked by LLM processing)
-                        console.log('[tts-pl] buffered early response for %s', rid);
-                        this._doneBuffer.set(rid, {
-                            chunks: this._wsPending.length > 0 ? [...this._wsPending[0].chunks] : [],
-                            timing,
-                        });
+                        console.log('[tts-pl] buffered early response for %s (%d chunks)', rid, chunks.length);
+                        this._doneBuffer.set(rid, { chunks, timing });
+                        // Evict oldest entries if buffer grows too large
+                        while (this._doneBuffer.size > PocketTtsProvider.MAX_DONE_BUFFER) {
+                            const oldest = this._doneBuffer.keys().next().value;
+                            this._doneBuffer.delete(oldest);
+                        }
                     }
                 }
                 this._updateStatus(this.ready);
@@ -417,6 +421,7 @@ class PocketTtsProvider {
             }
 
             if (msg.status === 'error') {
+                this._audioChunks = []; // discard partial audio from failed request
                 const errIds = msg?.request_id
                     ? (Array.isArray(msg.request_id) ? msg.request_id : [msg.request_id])
                     : (requestId ? [requestId] : []);
@@ -465,6 +470,14 @@ class PocketTtsProvider {
             this._worker = null;
             this._workerReady = false;
         }
+        // Reject all pending promises — worker is gone, no responses will come
+        for (const p of this._wsPending) {
+            clearTimeout(p.timeout);
+            p.promise._reject(new Error('Worker closed'));
+        }
+        this._wsPending = [];
+        this._audioChunks = [];
+        this._sendQueue = [];
     }
 
     _getWsUrl() {
@@ -490,14 +503,23 @@ class PocketTtsProvider {
     async previewTtsVoice(voiceId) {
         this.audioElement.pause();
         this.audioElement.currentTime = 0;
+        // Revoke previous blob URL if any
+        if (this._previewUrl) {
+            URL.revokeObjectURL(this._previewUrl);
+            this._previewUrl = null;
+        }
         const text = getPreviewString('en-US');
         try {
             for await (const blobPromise of this.generateTts(text, voiceId)) {
                 const blob = await blobPromise;
                 const url = URL.createObjectURL(blob);
+                this._previewUrl = url;
                 this.audioElement.src = url;
                 this.audioElement.play();
-                this.audioElement.onended = () => URL.revokeObjectURL(url);
+                this.audioElement.onended = () => {
+                    URL.revokeObjectURL(url);
+                    if (this._previewUrl === url) this._previewUrl = null;
+                };
                 return;
             }
         } catch (err) {
@@ -510,6 +532,8 @@ class PocketTtsProvider {
     dispose() {
         for (const p of this._wsPending) clearTimeout(p.timeout);
         this._wsPending = [];
+        this._doneBuffer.clear();
+        this._audioChunks = [];
         this._closeWorker();
     }
 }
