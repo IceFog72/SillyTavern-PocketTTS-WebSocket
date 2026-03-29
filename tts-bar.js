@@ -234,9 +234,9 @@ export function initTtsBar(extSettings) {
         if (playlistVisible) {
             renderPlaylist();
             // Set initial height if not set
-            if (!bar.el.style.height) bar.el.style.height = '250px';
+            if (!bar.el.style.minHeight || bar.el.style.minHeight === '35px') bar.el.style.minHeight = '250px';
         } else {
-            bar.el.style.height = '';
+            bar.el.style.minHeight = '35px';
         }
     });
 
@@ -252,7 +252,7 @@ export function initTtsBar(extSettings) {
         pointerId = e.pointerId;
         startClientY = e.clientY;
         startHeight = bar.el.offsetHeight;
-        try { bar.splitter.setPointerCapture(pointerId); } catch (e) {}
+        try { bar.splitter.setPointerCapture(pointerId); } catch (e) { }
         document.body.style.userSelect = 'none';
         window.addEventListener('pointermove', onPointerMove);
         window.addEventListener('pointerup', onPointerUp);
@@ -261,12 +261,12 @@ export function initTtsBar(extSettings) {
     function onPointerMove(e) {
         if (pointerId === null || e.pointerId !== pointerId) return;
         const delta = e.clientY - startClientY;
-        bar.el.style.height = Math.max(80, startHeight + delta) + 'px';
+        bar.el.style.minHeight = Math.max(80, startHeight + delta) + 'px';
     }
 
     function onPointerUp(e) {
         if (pointerId !== null && e.pointerId === pointerId) {
-            try { bar.splitter.releasePointerCapture(pointerId); } catch (e) {}
+            try { bar.splitter.releasePointerCapture(pointerId); } catch (e) { }
         }
         pointerId = null;
         document.body.style.userSelect = '';

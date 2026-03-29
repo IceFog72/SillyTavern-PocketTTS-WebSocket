@@ -11,7 +11,7 @@
     font-size: calc(var(--mainFontSize, 16px) * 0.85);
     color: var(--SmartThemeBodyColor);
     overflow: hidden;
-    min-height: 30px;
+    min-height: 35px;
 }
 
 /* Row 1: controls */
@@ -236,7 +236,7 @@ mark.ptts-hl-active {
 
 /* Horizontal splitter — drag to resize bar (outside bar) */
 .ptts-splitter {
-    height: 6px;
+    min-height: 6px;
     cursor: ns-resize;
     background: var(--SmartThemeBorderColor);
     display: flex;

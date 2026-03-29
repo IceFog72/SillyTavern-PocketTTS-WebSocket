@@ -44,6 +44,10 @@ const adp = {
     lastMsgId: null,       // current message being streamed — used to detect new message / swipe
     lastTextLen: 0,        // how many chars of chat[mes].mes we've already processed
     lastSeenPrefix: '',    // prefix of last seen fullText — used to detect in-place modifications
+    isUserMsg: false,      // whether current message is from user
+    msgCharName: '',       // character name from current message (name property)
+    bufferIsUser: false,   // isUser captured when buffer started (for this message)
+    bufferCharName: '',    // charName captured when buffer started (for this message)
 };
 
 
@@ -83,14 +87,19 @@ function splitSentences(text) {
 // different TTS voices. The voice map is stored in extension settings
 // and looked up by character name.
 
-function getVoiceId() {
+function getVoiceId(isUserMessage = false, charName = null) {
     const provider = window._pttsProvider;
     const es = window.extension_settings || extension_settings;
     const voiceMap = es?.tts?.['PocketTTS WebSocket']?.voiceMap || {};
-    const context = window.SillyTavern?.getContext?.();
-    const charName = context?.name2 || '[Default Voice]';
 
-    let voiceId = voiceMap[charName];
+    // Use provided charName, or fall back to global state, or context
+    const name = charName || adp.msgCharName || (isUserMessage
+        ? (window.SillyTavern?.getContext?.()?.name1 || 'User')
+        : (window.SillyTavern?.getContext?.()?.name2 || '[Default Voice]'));
+
+    let voiceId = voiceMap[name];
+    // Fallback for user messages: try "User" if actual name not found
+    if (!voiceId && isUserMessage) voiceId = voiceMap['User'];
     if (voiceId === '[Default Voice]') voiceId = voiceMap['[Default Voice]'];
     if (!voiceId || voiceId === 'disabled') {
         voiceId = voiceMap['[Default Voice]'] || provider?.settings?.voice || 'nova';
@@ -533,15 +542,18 @@ window._pttsSkipTrack = skipTrack;
 
 // ─── TTS Generation ────────────────────────────────────────────────
 
-async function adpGenerateAndPlay(msgId, text) {
+async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '') {
     if (!text || msgId == null) return;
     const provider = window._pttsProvider;
     if (!provider || !provider.ready) return;
-    const voiceId = getVoiceId();
+
+    // Use captured voice info
+    const voiceId = getVoiceId(isUser, charName);
+    log(`[tts] voice: ${voiceId} (${charName}${isUser ? ' user' : ''})`);
 
     // Add placeholder immediately (sync) — ensures correct order
     const trackIdx = adp.tracks.length;
-    const placeholder = { url: null, duration: 0, text, msgId, pending: true, error: null };
+    const placeholder = { url: null, duration: 0, text, msgId, pending: true, error: null, isUser, charName };
     adp.tracks.push(placeholder);
     log(`add #${trackIdx} msg=${msgId} "${text.substring(0, 50)}"`);
     refreshPlaylistUi();
@@ -634,7 +646,7 @@ function stopPeriodicTimer() {
 function flushBuffer() {
     const text = adp.textBuffer.trim();
     if (text.length > 0 && adp.lastMsgId != null) {
-        adpGenerateAndPlay(adp.lastMsgId, text);
+        adpGenerateAndPlay(adp.lastMsgId, text, adp.bufferIsUser, adp.bufferCharName);
         adp.textBuffer = '';
     }
 }
@@ -652,6 +664,9 @@ function processNewText(fullText, msgId) {
         adp.lastTextLen = 0;
         adp.textBuffer = '';
         adp.lastSeenPrefix = '';
+        // Capture voice info for THIS message's buffer
+        adp.bufferIsUser = adp.isUserMsg;
+        adp.bufferCharName = adp.msgCharName;
     }
 
     // Swipe detected (text got shorter = regenerated)
@@ -696,7 +711,7 @@ function processNewText(fullText, msgId) {
     if (sentences.length > 0) {
         adp.textBuffer = remainder;
         for (const sentence of sentences) {
-            adpGenerateAndPlay(adp.lastMsgId, sentence);
+            adpGenerateAndPlay(adp.lastMsgId, sentence, adp.bufferIsUser, adp.bufferCharName);
         }
     }
 }
@@ -718,9 +733,17 @@ function onTick() {
 
     const lastId = context.chat.length - 1;
     const lastMsg = context.chat[lastId];
-    if (!lastMsg || lastMsg.is_user || lastMsg.is_system) return;
+    if (!lastMsg || lastMsg.is_system) return;
+    // Skip user messages unless narrate_user is enabled
+    if (lastMsg.is_user && !extension_settings.tts.narrate_user) {
+        log(`[tts] skip user msg: narrate_user=${extension_settings.tts.narrate_user}`);
+        return;
+    }
     if (!lastMsg.mes && lastMsg.mes !== '') return;
 
+    adp.isUserMsg = !!lastMsg.is_user;
+    adp.msgCharName = lastMsg.name || (lastMsg.is_user ? context.name1 : context.name2);
+    log(`[tts] tick: isUser=${adp.isUserMsg} name=${adp.msgCharName}`);
     processNewText(lastMsg.mes, lastId);
 }
 
@@ -870,6 +893,8 @@ export function onActivate() {
         nukePlaylist();
         warmupAudio();
         adp.active = true;
+        adp.isUserMsg = !!message.is_user;
+        adp.msgCharName = message.name || (message.is_user ? context.name1 : context.name2);
         adp.textBuffer = '';
         lastSearchOffset = 0;
         adp.lastMsgId = null;
