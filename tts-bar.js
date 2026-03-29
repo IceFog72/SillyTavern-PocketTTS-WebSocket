@@ -230,8 +230,49 @@ export function initTtsBar(extSettings) {
     bar.playlistBtn.addEventListener('click', () => {
         playlistVisible = !playlistVisible;
         bar.playlistPanel.style.display = playlistVisible ? 'block' : 'none';
-        if (playlistVisible) renderPlaylist();
+        bar.splitter.style.display = playlistVisible ? 'block' : 'none';
+        if (playlistVisible) {
+            renderPlaylist();
+            // Set initial height if not set
+            if (!bar.el.style.height) bar.el.style.height = '250px';
+        } else {
+            bar.el.style.height = '';
+        }
     });
+
+    // ─── Splitter Drag ──────────────────────────────────
+
+    let pointerId = null;
+    let startClientY = 0;
+    let startHeight = 0;
+
+    bar.splitter.addEventListener('pointerdown', (e) => {
+        if (e.button && e.button !== 0) return;
+        e.preventDefault();
+        pointerId = e.pointerId;
+        startClientY = e.clientY;
+        startHeight = bar.el.offsetHeight;
+        try { bar.splitter.setPointerCapture(pointerId); } catch (e) {}
+        document.body.style.userSelect = 'none';
+        window.addEventListener('pointermove', onPointerMove);
+        window.addEventListener('pointerup', onPointerUp);
+    });
+
+    function onPointerMove(e) {
+        if (pointerId === null || e.pointerId !== pointerId) return;
+        const delta = e.clientY - startClientY;
+        bar.el.style.height = Math.max(80, startHeight + delta) + 'px';
+    }
+
+    function onPointerUp(e) {
+        if (pointerId !== null && e.pointerId === pointerId) {
+            try { bar.splitter.releasePointerCapture(pointerId); } catch (e) {}
+        }
+        pointerId = null;
+        document.body.style.userSelect = '';
+        window.removeEventListener('pointermove', onPointerMove);
+        window.removeEventListener('pointerup', onPointerUp);
+    }
 
     function renderPlaylist() {
         if (!playlistVisible) return;
@@ -297,28 +338,29 @@ function createBarElements() {
             <span class="ptts-speed" id="ptts-speed" title="Click to change speed">1.0x</span>
             <button class="ptts-btn" id="ptts-highlight" title="Highlight playing text"><i class="fa-solid fa-highlighter"></i></button>
             <button class="ptts-btn" id="ptts-playlist" title="Playlist"><i class="fa-solid fa-list"></i></button>
-            <button class="ptts-btn" id="ptts-dl" title="Download"><i class="fa-solid fa-download"></i></button>
+            <button class="ptts-btn" id="ptts-dl" title="Download" style="display:none"><i class="fa-solid fa-download"></i></button>
         </div>
+        <div id="ptts-playlist-panel" style="display:none"></div>
     `;
 
-    // Playlist panel — expands above the bar
-    const panel = document.createElement('div');
-    panel.id = 'ptts-playlist-panel';
-    panel.style.display = 'none';
+    // Splitter — outside bar so it doesn't move when bar resizes
+    const splitter = document.createElement('div');
+    splitter.className = 'ptts-splitter';
+    splitter.style.display = 'none';
 
-    // Insert panel + bar before #chat
+    // Insert bar + splitter before #chat (bar above, splitter below)
     const chat = document.getElementById('chat');
     if (chat) {
-        chat.before(panel);
         chat.before(el);
+        chat.before(splitter);
     } else {
         const formSheld = document.getElementById('form_sheld');
         if (formSheld) {
-            formSheld.before(panel);
             formSheld.before(el);
+            formSheld.before(splitter);
         } else {
-            document.body.appendChild(panel);
             document.body.appendChild(el);
+            document.body.appendChild(splitter);
         }
     }
 
@@ -336,7 +378,8 @@ function createBarElements() {
         highlightBtn: el.querySelector('#ptts-highlight'),
         playlistBtn: el.querySelector('#ptts-playlist'),
         dlBtn: el.querySelector('#ptts-dl'),
-        playlistPanel: panel,
+        splitter,
+        playlistPanel: el.querySelector('#ptts-playlist-panel'),
     };
 }
 

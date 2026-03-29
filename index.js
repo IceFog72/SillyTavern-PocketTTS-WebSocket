@@ -43,22 +43,9 @@ const adp = {
     textBuffer: '',        // accumulates chars from streaming text until sentence boundary found
     lastMsgId: null,       // current message being streamed — used to detect new message / swipe
     lastTextLen: 0,        // how many chars of chat[mes].mes we've already processed
+    lastSeenPrefix: '',    // prefix of last seen fullText — used to detect in-place modifications
 };
 
-// ─── Narrate Highlight State ───────────────────────────────────────
-
-const narrator = {
-    active: false,
-    messageId: null,
-    text: '',
-    words: [],
-    wordIdx: 0,
-    elapsed: 0,
-    lastTick: 0,
-    sentences: [{ text: '', duration: 0 }],
-};
-
-let narratorTimer = null;
 
 // ─── Sentence Detection ────────────────────────────────────────────
 // WHY sentence-based splitting: the server generates audio per-sentence.
@@ -67,9 +54,10 @@ let narratorTimer = null;
 // the first sentence to play while the second is still generating.
 
 // Matches: [sentence ending with .!?…] followed by optional closing
-// punctuation (quotes, parens, smart quotes) then whitespace.
+// punctuation (parens only) then whitespace.
 // The \s+ ensures we only split at actual word boundaries, not mid-word.
-const SENTENCE_END = /[.!?…][)"'\u2019\u201D\u00BB\u300D\u300F\uFF02]*\s+/g;
+// NOTE: quotes removed from closing chars — they cause corruption when splitting quoted dialogue.
+const SENTENCE_END = /[.!?…][)]*\s+/g;
 
 function splitSentences(text) {
     const result = [];
@@ -196,6 +184,22 @@ function clearHighlight() {
     highlightContainer = null;
 }
 
+// Map position in normalized (whitespace-collapsed) text back to original position
+function mapNormalizedPos(original, normPos) {
+    let oi = 0, ni = 0;
+    let inWhitespace = false;
+    while (ni < normPos && oi < original.length) {
+        if (/\s/.test(original[oi])) {
+            if (!inWhitespace) { ni++; inWhitespace = true; }
+        } else {
+            ni++;
+            inWhitespace = false;
+        }
+        oi++;
+    }
+    return oi;
+}
+
 function highlightForText(playingText, msgId) {
     clearHighlight();
     if (!highlightEnabled || !playingText) return;
@@ -233,18 +237,22 @@ function highlightForText(playingText, msgId) {
         .replace(/\*(.+?)\*/g, '$1')      // italic
         .replace(/~~(.+?)~~/g, '$1');      // strikethrough
 
+    // Normalize whitespace — DOM may have newlines from HTML structure
+    const normalize = (s) => s.replace(/\s+/g, ' ');
+
     // Search for original playing text as substring (preserves contractions like You're, I'll)
-    const lowerFull = fullText.toLowerCase();
-    const search = stripMd(playingText.trim().toLowerCase());
+    const lowerFull = normalize(fullText.toLowerCase());
+    const search = normalize(stripMd(playingText.trim().toLowerCase()));
     if (!search) return;
 
     let pos = lowerFull.indexOf(search, lastSearchOffset);
     if (pos < 0) pos = lowerFull.indexOf(search, 0);
     if (pos < 0) return;
 
-    const matchStart = pos;
-    const matchEnd = pos + search.length;
-    lastSearchOffset = matchEnd;
+    // Map normalized position back to original text position
+    const matchStart = mapNormalizedPos(fullText, pos);
+    const matchEnd = mapNormalizedPos(fullText, pos + search.length);
+    lastSearchOffset = pos + search.length;
 
     // Wrap matching text nodes in <mark> — safe even across HTML element boundaries
     for (let i = nodes.length - 1; i >= 0; i--) {
@@ -273,225 +281,10 @@ function highlightForText(playingText, msgId) {
     if (firstMark) firstMark.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
-// ─── Narrate Highlight ─────────────────────────────────────────────
-
-async function getAudioDuration(blobOrUrl) {
-    return new Promise(resolve => {
-        let url;
-        if (blobOrUrl instanceof Blob) {
-            url = URL.createObjectURL(blobOrUrl);
-        } else if (typeof blobOrUrl === 'string') {
-            url = blobOrUrl;
-        } else {
-            resolve(0);
-            return;
-        }
-        const a = new Audio();
-        a.preload = 'metadata';
-        a.onloadedmetadata = () => {
-            const d = a.duration;
-            if (blobOrUrl instanceof Blob) URL.revokeObjectURL(url);
-            resolve(isFinite(d) && d > 0 ? d : 0);
-        };
-        a.onerror = () => {
-            if (blobOrUrl instanceof Blob) URL.revokeObjectURL(url);
-            resolve(0);
-        };
-        a.src = url;
-    });
-}
-
-function buildWordHtml(text) {
-    // Strip markdown so HTML matches rendered DOM (no backticks in <code> tags)
-    const clean = text
-        .replace(/`{1,3}/g, '')
-        .replace(/\*\*(.+?)\*\*/g, '$1')
-        .replace(/\*(.+?)\*/g, '$1')
-        .replace(/~~(.+?)~~/g, '$1');
-
-    const words = [];
-    let html = '';
-    let lastEnd = 0;
-    const re = /[\w']+/g;
-    let m;
-    while ((m = re.exec(clean)) !== null) {
-        html += clean.substring(lastEnd, m.index);
-        const idx = words.length;
-        words.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
-        html += `<mark class="ptts-hl-word" data-wi="${idx}">${m[0]}</mark>`;
-        lastEnd = m.index + m[0].length;
-    }
-    html += clean.substring(lastEnd);
-    return { html, words };
-}
-
-function startNarrateHighlight(text, messageId) {
-    if (!highlightEnabled || !text) return;
-    stopNarrateHighlight();
-
-    if (messageId != null) {
-        const context = window.SillyTavern?.getContext?.();
-        const msg = context?.chat?.[messageId];
-        if (msg?.is_system) return;
-    }
-
-    narrator.active = true;
-    narrator.messageId = messageId;
-    narrator.text = text;
-    narrator.wordIdx = 0;
-    narrator.elapsed = 0;
-    narrator.lastTick = performance.now();
-    narrator.sentences = [{ text: '', duration: 0 }];
-
-    const { html, words } = buildWordHtml(text);
-    narrator.words = words;
-    if (words.length === 0) return;
-
-    let target = null;
-    if (messageId != null) {
-        target = document.querySelector(`.mes[mesid="${messageId}"] .mes_text`);
-    }
-    if (target && target.closest('.smallSysMes')) return;
-    if (!target) target = document.querySelector('.mes.last_mes .mes_text');
-    if (!target || target.closest('.smallSysMes')) return;
-
-    const layer = ensureHighlightLayerFor(target);
-    if (!layer) return;
-    layer.innerHTML = html;
-    layer.style.display = 'block';
-
-    narratorTimer = setInterval(updateNarrateHighlight, 150);
-}
-
-async function onNarrateAudioReady(data) {
-    if (!narrator.active) return;
-    narrator.text += (narrator.text ? ' ' : '') + data.text;
-
-    const dur = await getAudioDuration(data.audio);
-    if (!narrator.active) return;
-    const last = narrator.sentences[narrator.sentences.length - 1];
-    if (last.duration === 0 && last.text === '') {
-        last.text = data.text;
-        last.duration = dur;
-    } else {
-        narrator.sentences.push({ text: data.text, duration: dur });
-    }
-}
-
-function stopNarrateHighlight() {
-    if (narratorTimer) { clearInterval(narratorTimer); narratorTimer = null; }
-    narrator.active = false;
-    narrator.text = '';
-    narrator.words = [];
-    narrator.sentences = [{ text: '', duration: 0 }];
-    narrator.wordIdx = 0;
-    narrator.elapsed = 0;
-    clearHighlight();
-}
-
-function updateNarrateHighlight() {
-    if (!narrator.active || narrator.words.length === 0) return;
-
-    const stAudio = document.getElementById('tts_audio');
-    if (!stAudio || stAudio.paused) return;
-
-    let totalDur = 0;
-    for (const s of narrator.sentences) totalDur += s.duration;
-    if (totalDur <= 0) return;
-
-    const totalWords = narrator.words.length;
-    const progress = stAudio.currentTime / totalDur;
-    const newIdx = Math.min(Math.floor(progress * totalWords), totalWords - 1);
-
-    if (newIdx === narrator.wordIdx) return;
-    narrator.wordIdx = newIdx;
-
-    const layer = document.querySelector('.ptts-highlight-layer');
-    if (!layer) return;
-    const marks = layer.querySelectorAll('mark.ptts-hl-word');
-    marks.forEach((mark, i) => {
-        if (i <= newIdx) mark.classList.add('ptts-hl-active');
-        else mark.classList.remove('ptts-hl-active');
-    });
-
-    const activeMark = marks[newIdx];
-    if (activeMark) activeMark.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-}
-
-let stAudioEl = null;
-let stAudioListenersAttached = false;
-
-function setupStAudioListeners() {
-    const el = document.getElementById('tts_audio');
-    if (!el) return;
-    if (el === stAudioEl && stAudioListenersAttached) return;
-
-    stAudioEl = el;
-    stAudioListenersAttached = true;
-
-    el.addEventListener('pause', () => {
-        if (narrator.active) {
-            setTimeout(() => {
-                if (narrator.active && el.paused) stopNarrateHighlight();
-            }, 500);
-        }
-    });
-}
-
-function pollForStAudio() {
-    setupStAudioListeners();
-    if (stAudioListenersAttached) return;
-    const id = setInterval(() => {
-        setupStAudioListeners();
-        if (stAudioListenersAttached) clearInterval(id);
-    }, 2000);
-}
-
-function ensureHighlightLayerFor(mesEl) {
-    if (!mesEl) return null;
-
-    if (mesEl.parentElement.classList.contains('ptts-highlight-wrap')) {
-        return mesEl.parentElement.querySelector('.ptts-highlight-layer');
-    }
-
-    const mesStyle = window.getComputedStyle(mesEl);
-    const wrap = document.createElement('div');
-    wrap.className = 'ptts-highlight-wrap';
-    wrap.style.position = 'relative';
-    wrap.style.display = mesStyle.display;
-    wrap.style.margin = mesStyle.margin;
-
-    mesEl.parentNode.insertBefore(wrap, mesEl);
-    wrap.appendChild(mesEl);
-    mesEl.style.margin = '0';
-    mesEl.style.padding = '0';
-
-    const layer = document.createElement('div');
-    layer.className = 'ptts-highlight-layer';
-    layer.style.fontFamily = mesStyle.fontFamily;
-    layer.style.fontSize = mesStyle.fontSize;
-    layer.style.fontWeight = mesStyle.fontWeight;
-    layer.style.fontStyle = mesStyle.fontStyle;
-    layer.style.lineHeight = mesStyle.lineHeight;
-    layer.style.letterSpacing = mesStyle.letterSpacing;
-    layer.style.wordSpacing = mesStyle.wordSpacing;
-    layer.style.textAlign = mesStyle.textAlign;
-    layer.style.textIndent = mesStyle.textIndent;
-    layer.style.margin = '0';
-
-    wrap.appendChild(layer);
-    highlightContainer = wrap;
-    highlightLayer = layer;
-    return layer;
-}
-
 window._pttsHighlightToggle = function () {
     highlightEnabled = !highlightEnabled;
     localStorage.setItem('ptts-highlight', highlightEnabled);
-    if (!highlightEnabled) {
-        clearHighlight();
-        stopNarrateHighlight();
-    }
+    if (!highlightEnabled) clearHighlight();
     return highlightEnabled;
 };
 
@@ -546,16 +339,13 @@ function playNextInQueue() {
     if (!audioWarmupDone) {
         const url = URL.createObjectURL(new Blob([new Uint8Array(44)], { type: 'audio/wav' }));
         audioWarmupDone = true;
-        pttsAudio.volume = 0.01;
         pttsAudio.src = url;
         pttsAudio.onended = () => {
-            pttsAudio.volume = 1;
             URL.revokeObjectURL(url);
             pttsAudio.onended = null;
-            playNextInQueue(); // retry now that audio is warmed up
+            playNextInQueue();
         };
         pttsAudio.onerror = () => {
-            pttsAudio.volume = 1;
             URL.revokeObjectURL(url);
             pttsAudio.onerror = null;
             playNextInQueue();
@@ -861,6 +651,7 @@ function processNewText(fullText, msgId) {
         adp.lastMsgId = msgId;
         adp.lastTextLen = 0;
         adp.textBuffer = '';
+        adp.lastSeenPrefix = '';
     }
 
     // Swipe detected (text got shorter = regenerated)
@@ -869,13 +660,35 @@ function processNewText(fullText, msgId) {
         nukeMsgTracks(msgId);
         adp.lastTextLen = 0;
         adp.textBuffer = '';
+        adp.lastSeenPrefix = '';
     }
 
     if (!fullText || fullText.length <= adp.lastTextLen) return;
 
+    // Detect text modification — ST may change text during streaming (parse reasoning, apply regex)
+    // If previously seen text doesn't match current prefix, reset tracking
+    if (adp.lastTextLen > 0 && adp.lastSeenPrefix) {
+        const currentPrefix = fullText.substring(0, Math.min(adp.lastTextLen, fullText.length));
+        if (currentPrefix !== adp.lastSeenPrefix) {
+            // Text was modified — reprocess from the last known good position
+            log(`text modified at ${adp.lastTextLen}, resetting`);
+            // Find where our last seen prefix still matches
+            let newOffset = 0;
+            for (let i = Math.min(adp.lastSeenPrefix.length, fullText.length) - 1; i > 0; i--) {
+                if (fullText.startsWith(adp.lastSeenPrefix.substring(0, i))) {
+                    newOffset = i;
+                    break;
+                }
+            }
+            adp.lastTextLen = newOffset;
+            adp.textBuffer = adp.textBuffer.substring(0, Math.max(0, adp.textBuffer.length - (adp.lastSeenPrefix.length - newOffset)));
+        }
+    }
+
     // Append new text to global buffer
     const newText = fullText.substring(adp.lastTextLen);
     adp.lastTextLen = fullText.length;
+    adp.lastSeenPrefix = fullText.substring(0, adp.lastTextLen);
     adp.textBuffer += newText;
 
     // Split sentences and push to queue — server merges short ones
@@ -895,6 +708,7 @@ function onSwipe() {
     adp.lastMsgId = null;
     adp.lastTextLen = 0;
     adp.textBuffer = '';
+    adp.lastSeenPrefix = '';
 }
 
 function onTick() {
@@ -979,7 +793,7 @@ function enableStTts() {
 }
 
 function onProviderDropdownChange() {
-    stopNarrateHighlight();
+    clearHighlight();
     if (isPocketTtsActive()) disableStTts();
     else enableStTts();
 }
@@ -1000,6 +814,7 @@ function onGenerationStarted(generationType, _args, isDryRun) {
     lastSearchOffset = 0;
     adp.lastMsgId = null;
     adp.lastTextLen = 0;
+    adp.lastSeenPrefix = '';
 
     startPeriodicTimer();
 }
@@ -1039,26 +854,38 @@ export function onActivate() {
 
     initTtsBar(extension_settings);
 
+    // Override narrate button — handle directly with PocketTTS
+    $(document).on('click', '.mes_narrate', function (e) {
+        if (!isPocketTtsActive()) return; // let ST handle it
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        const context = window.SillyTavern?.getContext?.();
+        const id = $(this).closest('.mes').attr('mesid');
+        const message = context?.chat?.[id];
+        if (!message || !message.mes) return;
+
+        log(`narrate msg=${id}`);
+        clearHighlight();
+        nukePlaylist();
+        warmupAudio();
+        adp.active = true;
+        adp.textBuffer = '';
+        lastSearchOffset = 0;
+        adp.lastMsgId = null;
+        adp.lastTextLen = 0;
+        adp.lastSeenPrefix = '';
+
+        // Process the full message immediately
+        processNewText(message.mes, Number(id));
+        flushBuffer();
+        adp.active = false;
+    });
+
     eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
     eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
     eventSource.on(event_types.GENERATION_STOPPED, onGenerationEnded);
     eventSource.on(event_types.MESSAGE_SWIPED, onSwipe);
-
-    eventSource.on(event_types.TTS_JOB_STARTED, (data) => {
-        if (!highlightEnabled) return;
-        if (adp.active) return;
-        startNarrateHighlight(data.text || '', data.messageId);
-    });
-    eventSource.on(event_types.TTS_AUDIO_READY, (data) => {
-        if (!narrator.active) return;
-        onNarrateAudioReady(data);
-    });
-    eventSource.on(event_types.TTS_JOB_COMPLETE, () => {
-        if (!narrator.active) return;
-        setTimeout(() => stopNarrateHighlight(), 1500);
-    });
-
-    pollForStAudio();
 
     // Clean up on page unload — revoke blob URLs, stop provider
     window.addEventListener('beforeunload', () => {

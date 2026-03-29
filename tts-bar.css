@@ -2,6 +2,7 @@
 
 #ptts-bar {
     display: flex;
+    flex-direction: column;
     border: 1px solid var(--SmartThemeBorderColor);
     background-color: var(--SmartThemeBlurTintColor);
     backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
@@ -9,6 +10,8 @@
     padding: 6px 10px;
     font-size: calc(var(--mainFontSize, 16px) * 0.85);
     color: var(--SmartThemeBodyColor);
+    overflow: hidden;
+    min-height: 30px;
 }
 
 /* Row 1: controls */
@@ -221,17 +224,40 @@ mark.ptts-hl-active {
     margin-bottom: 10px !important;
 }
 
-/* Playlist panel — expands above the bar */
+/* Playlist panel — inside bar, fills remaining space */
 #ptts-playlist-panel {
-    border: 1px solid var(--SmartThemeBorderColor);
-    background-color: var(--SmartThemeBlurTintColor);
-    backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
-    -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
+    flex: 1;
+    overflow-y: auto;
     padding: 4px 0;
     font-size: calc(var(--mainFontSize, 16px) * 0.8);
     color: var(--SmartThemeBodyColor);
-    min-height: 200px;
-    overflow-y: auto;
+    min-height: 60px;
+}
+
+/* Horizontal splitter — drag to resize bar (outside bar) */
+.ptts-splitter {
+    height: 6px;
+    cursor: ns-resize;
+    background: var(--SmartThemeBorderColor);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.ptts-splitter::after {
+    content: '';
+    width: 40px;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 2px;
+}
+
+.ptts-splitter:hover {
+    background: rgba(255, 200, 0, 0.3);
+}
+
+.ptts-splitter:hover::after {
+    background: rgba(255, 200, 0, 0.6);
 }
 
 .ptts-pl-empty {
