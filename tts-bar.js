@@ -202,7 +202,7 @@ export function initTtsBar(extSettings) {
     bar.dlBtn.addEventListener('click', () => {
         if (!audio || !audio.src) return;
         const es = window.extension_settings || extSettings;
-        const fmt = es?.tts?.PocketTTS?.format || 'mp3';
+        const fmt = es?.tts?.['PocketTTS WebSocket']?.format || 'mp3';
         const a = document.createElement('a');
         a.href = audio.src;
         a.download = 'tts-audio.' + fmt;
@@ -212,7 +212,7 @@ export function initTtsBar(extSettings) {
     // Highlight toggle — only visible for PocketTTS provider
     function updateHighlightBtn() {
         const es = window.extension_settings || extSettings;
-        const isPocketTts = es?.tts?.currentProvider === 'PocketTTS';
+        const isPocketTts = es?.tts?.currentProvider === 'PocketTTS WebSocket';
         bar.highlightBtn.style.display = isPocketTts ? '' : 'none';
         const on = window._pttsHighlightEnabled?.() ?? false;
         const icon = bar.highlightBtn.querySelector('i');

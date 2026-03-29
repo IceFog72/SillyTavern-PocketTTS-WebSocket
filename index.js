@@ -98,7 +98,7 @@ function splitSentences(text) {
 function getVoiceId() {
     const provider = window._pttsProvider;
     const es = window.extension_settings || extension_settings;
-    const voiceMap = es?.tts?.PocketTTS?.voiceMap || {};
+    const voiceMap = es?.tts?.['PocketTTS WebSocket']?.voiceMap || {};
     const context = window.SillyTavern?.getContext?.();
     const charName = context?.name2 || '[Default Voice]';
 
@@ -542,6 +542,28 @@ function playNextInQueue() {
         return;
     }
 
+    // Warmup audio system before first track plays
+    if (!audioWarmupDone) {
+        const url = URL.createObjectURL(new Blob([new Uint8Array(44)], { type: 'audio/wav' }));
+        audioWarmupDone = true;
+        pttsAudio.volume = 0.01;
+        pttsAudio.src = url;
+        pttsAudio.onended = () => {
+            pttsAudio.volume = 1;
+            URL.revokeObjectURL(url);
+            pttsAudio.onended = null;
+            playNextInQueue(); // retry now that audio is warmed up
+        };
+        pttsAudio.onerror = () => {
+            pttsAudio.volume = 1;
+            URL.revokeObjectURL(url);
+            pttsAudio.onerror = null;
+            playNextInQueue();
+        };
+        pttsAudio.play().catch(() => playNextInQueue());
+        return;
+    }
+
     adp.playingIdx = nextIdx;
     adp.isPlaying = true;
     adp.playingTrack = item.text;
@@ -630,6 +652,7 @@ function nukePlaylist() {
 
     adp.tracks = [];
     adp.playingIdx = -1;
+    audioWarmupDone = false;
     refreshPlaylistUi();
 }
 
@@ -892,8 +915,6 @@ function onTick() {
 let audioWarmupDone = false;
 
 function warmupAudio() {
-    if (audioWarmupDone) return;
-    audioWarmupDone = true;
     const url = URL.createObjectURL(new Blob([new Uint8Array(44)], { type: 'audio/wav' }));
     const audio = new Audio(url);
     audio.volume = 0.01;
@@ -919,7 +940,7 @@ let stSettingsSaved = null;
 
 function isPocketTtsActive() {
     const es = window.extension_settings || extension_settings;
-    return es?.tts?.currentProvider === 'PocketTTS' && es?.tts?.enabled === true;
+    return es?.tts?.currentProvider === 'PocketTTS WebSocket' && es?.tts?.enabled === true;
 }
 
 function disableStTts() {
@@ -998,7 +1019,7 @@ function onGenerationEnded() {
 // ─── Entry Point ───────────────────────────────────────────────────
 
 export function onActivate() {
-    registerTtsProvider('PocketTTS', PocketTtsProvider);
+    registerTtsProvider('PocketTTS WebSocket', PocketTtsProvider);
 
     window._pttsAudio = pttsAudio;
 
