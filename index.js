@@ -258,12 +258,33 @@ function highlightForText(playingText, msgId) {
 
     let pos = lowerFull.indexOf(search, lastSearchOffset);
     if (pos < 0) pos = lowerFull.indexOf(search, 0);
+    let matchedLen = search.length;
+
+    // Fallback: ST may have modified the DOM (removed reasoning, applied regex),
+    // so the full playing text no longer exists as a substring. Try matching
+    // the longest suffix starting at a sentence boundary — the end of the chunk
+    // is most likely to still exist in the DOM.
+    if (pos < 0) {
+        const parts = search.split(/(?<=[.!?…])\s+/);
+        for (let i = 0; i < parts.length; i++) {
+            const suffix = parts.slice(i).join(' ');
+            if (suffix.length < 10) break;
+            const found = lowerFull.indexOf(suffix);
+            if (found >= 0) { pos = found; matchedLen = suffix.length; break; }
+        }
+        // Last resort: try last half of text
+        if (pos < 0 && search.length > 20) {
+            const half = search.substring(Math.floor(search.length / 2));
+            const found = lowerFull.indexOf(half);
+            if (found >= 0) { pos = found; matchedLen = half.length; }
+        }
+    }
     if (pos < 0) return;
 
     // Map normalized position back to original text position
     const matchStart = mapNormalizedPos(fullText, pos);
-    const matchEnd = mapNormalizedPos(fullText, pos + search.length);
-    lastSearchOffset = pos + search.length;
+    const matchEnd = mapNormalizedPos(fullText, pos + matchedLen);
+    lastSearchOffset = pos + matchedLen;
 
     // Wrap matching text nodes in <mark> — safe even across HTML element boundaries
     for (let i = nodes.length - 1; i >= 0; i--) {
@@ -433,6 +454,7 @@ function nukePlaylist() {
     // Tell worker to clear its send queue — in-flight server requests will
     // complete but main thread will ignore their responses (no matching promise)
     window._pttsProvider?._worker?.postMessage({ type: 'clear' });
+    if (window._pttsProvider) window._pttsProvider._sendQueue = [];
 
     // Revoke all blob URLs
     for (const t of adp.tracks) {
@@ -729,7 +751,15 @@ function processNewText(fullText, msgId) {
                 }
             }
             adp.lastTextLen = newOffset;
-            adp.textBuffer = adp.textBuffer.substring(0, Math.max(0, adp.textBuffer.length - (adp.lastSeenPrefix.length - newOffset)));
+            const charsDeleted = adp.lastSeenPrefix.length - newOffset;
+            if (charsDeleted > 0 && adp.textBuffer.length > 0) {
+                // Deletion overlaps with buffer — trim buffer, but don't go below 0
+                const trim = Math.min(charsDeleted, adp.textBuffer.length);
+                adp.textBuffer = adp.textBuffer.substring(0, adp.textBuffer.length - trim);
+                if (charsDeleted > trim) {
+                    log(`text modified: ${charsDeleted - trim} chars lost (deletion exceeds buffer)`);
+                }
+            }
         }
     }
 
@@ -928,14 +958,18 @@ export function onActivate() {
 
     ttsBarCleanup = initTtsBar(extension_settings);
 
-    // Override narrate button — handle directly with PocketTTS
-    $(document).on('click.ptts', '.mes_narrate', function (e) {
-        if (!isPocketTtsActive()) return; // let ST handle it
+    // Override narrate button — capturing-phase handler fires before ST's bubbling handler.
+    // jQuery delegated handlers fire during bubble phase, AFTER direct element handlers.
+    // Using capturing ensures we intercept first and stopImmediatePropagation blocks ST.
+    function narrateCaptureHandler(e) {
+        const btn = e.target.closest('.mes_narrate');
+        if (!btn) return;
+        if (!isPocketTtsActive()) return;
         e.stopImmediatePropagation();
         e.preventDefault();
 
         const context = window.SillyTavern?.getContext?.();
-        const id = $(this).closest('.mes').attr('mesid');
+        const id = btn.closest('.mes')?.getAttribute('mesid');
         const message = context?.chat?.[id];
         if (!message || !message.mes) return;
 
@@ -952,11 +986,12 @@ export function onActivate() {
         adp.lastTextLen = 0;
         adp.lastSeenPrefix = '';
 
-        // Process the full message immediately
         processNewText(message.mes, Number(id));
         flushBuffer();
         adp.active = false;
-    });
+    }
+    document.addEventListener('click', narrateCaptureHandler, true);
+    window._pttsNarrateCaptureHandler = narrateCaptureHandler;
 
     eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
     eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
@@ -973,7 +1008,10 @@ export function onActivate() {
 export function onDeactivate() {
     // Remove namespaced event listeners
     $('#tts_provider').off('change.ptts');
-    $(document).off('click.ptts', '.mes_narrate');
+    if (window._pttsNarrateCaptureHandler) {
+        document.removeEventListener('click', window._pttsNarrateCaptureHandler, true);
+        delete window._pttsNarrateCaptureHandler;
+    }
     eventSource.off(event_types.GENERATION_STARTED, onGenerationStarted);
     eventSource.off(event_types.GENERATION_ENDED, onGenerationEnded);
     eventSource.off(event_types.GENERATION_STOPPED, onGenerationEnded);

@@ -85,5 +85,9 @@ self.onmessage = (event) => {
             pendingSends = [];
             if (ws) try { ws.close(); } catch {}
             break;
+
+        case 'clear':
+            pendingSends = [];
+            break;
     }
 };

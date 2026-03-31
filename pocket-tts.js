@@ -10,6 +10,7 @@ class PocketTtsProvider {
     ready = false;
     voices = [];
     separator = '. ';
+    static EXPECTED_SERVER_VERSION = '2.0.0';
 
     audioElement = document.createElement('audio');
 
@@ -64,6 +65,7 @@ class PocketTtsProvider {
                 value="${this.defaultSettings.provider_endpoint}" placeholder="http://localhost:8005" />
 
             <div id="ptts_server_info" style="margin:4px 0;font-size:0.85em;color:#888;"></div>
+            <div id="ptts_version_warning" style="margin:4px 0;font-size:0.85em;display:none;"></div>
             <div id="ptts_status" style="margin:4px 0;font-size:0.85em;">
                 <span style="color:#888;">●</span> Not connected
             </div>
@@ -119,6 +121,19 @@ class PocketTtsProvider {
         parts.push(info.voice_cloning ? 'Voice cloning: ON' : 'Voice cloning: OFF');
         el.textContent = parts.join(' | ');
         el.style.color = '#6a6';
+
+        // Version check
+        const warnEl = document.getElementById('ptts_version_warning');
+        if (warnEl) {
+            const serverVer = info.version || '';
+            const expected = PocketTtsProvider.EXPECTED_SERVER_VERSION;
+            if (serverVer && serverVer !== expected) {
+                warnEl.innerHTML = `<span style="color:#f44336;">&#9888; Version mismatch: server ${serverVer}, extension expects ${expected}. Please update the server.</span>`;
+                warnEl.style.display = 'block';
+            } else {
+                warnEl.style.display = 'none';
+            }
+        }
     }
 
     // ─── Settings Load / Change ─────────────────────────────────────
