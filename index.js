@@ -30,6 +30,8 @@ const log = (...args) => console.log('[tts-pl]', ...args);
 
 // ─── State ─────────────────────────────────────────────────────────
 
+let ttsBarCleanup = null;
+
 const adp = {
     // WHY flat array: tracks are ordered by text arrival = play order.
     // Each {url, duration, text, msgId, pending, error}.
@@ -71,7 +73,7 @@ function splitSentences(text) {
 
     while ((match = SENTENCE_END.exec(text)) !== null) {
         const end = match.index + match[0].length;
-        const s = text.substring(lastIdx, end).trim();
+        const s = text.substring(lastIdx, end).trimStart();
         if (s.length > 0) result.push(s);
         lastIdx = end;
     }
@@ -569,12 +571,51 @@ async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '') {
         if (blobs.length === 0) {
             const idx = adp.tracks.indexOf(placeholder);
             if (idx >= 0) {
-                // Append merged text to previous track's text (for UI display)
-                if (idx > 0) {
-                    const prev = adp.tracks[idx - 1];
-                    if (prev && !prev.error) {
-                        prev.text = prev.text + ' ' + text;
+                // Find the track that got the merged audio.
+                // Search backwards first (most likely), then forwards.
+                // The merged track is the one that just completed (has url, not pending).
+                let targetIdx = -1;
+                for (let i = idx - 1; i >= 0; i--) {
+                    if (adp.tracks[i] && adp.tracks[i].url && !adp.tracks[i].pending) {
+                        targetIdx = i;
+                        break;
                     }
+                }
+                if (targetIdx < 0) {
+                    for (let i = idx + 1; i < adp.tracks.length; i++) {
+                        if (adp.tracks[i] && adp.tracks[i].url && !adp.tracks[i].pending) {
+                            targetIdx = i;
+                            break;
+                        }
+                    }
+                }
+                if (targetIdx >= 0) {
+                    adp.tracks[targetIdx].text = adp.tracks[targetIdx].text + ' ' + text;
+                    log(`merged #${trackIdx} → #${targetIdx} msg=${msgId}`);
+                } else {
+                    // Target not ready yet — defer removal until it appears.
+                    // This can happen when both promises resolve in the same tick
+                    // but the target's adpGenerateAndPlay hasn't set url yet.
+                    queueMicrotask(() => {
+                        const curIdx = adp.tracks.indexOf(placeholder);
+                        if (curIdx < 0) return; // already handled
+                        let tIdx = -1;
+                        for (let i = 0; i < adp.tracks.length; i++) {
+                            if (i !== curIdx && adp.tracks[i] && adp.tracks[i].url && !adp.tracks[i].pending) {
+                                tIdx = i;
+                                break;
+                            }
+                        }
+                        if (tIdx >= 0) {
+                            adp.tracks[tIdx].text = adp.tracks[tIdx].text + ' ' + text;
+                            log(`merged (deferred) #${trackIdx} → #${tIdx} msg=${msgId}`);
+                        } else {
+                            log(`merged #${trackIdx} msg=${msgId} (no target found)`);
+                        }
+                        adp.tracks.splice(curIdx, 1);
+                        refreshPlaylistUi();
+                    });
+                    return;
                 }
                 adp.tracks.splice(idx, 1);
             }
@@ -582,7 +623,6 @@ async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '') {
             if (adp.playingIdx >= 0 && idx >= 0 && idx <= adp.playingIdx) {
                 adp.playingIdx--;
             }
-            log(`merged #${trackIdx} msg=${msgId} "${text.substring(0, 40)}"`);
             refreshPlaylistUi();
             return;
         }
@@ -609,13 +649,6 @@ async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '') {
         placeholder.url = URL.createObjectURL(combined);
         placeholder.duration = provider.lastTiming.audio_duration || (text.length / 15);
         placeholder.pending = false;
-
-        // Check for out-of-order: earlier track still pending?
-        for (let i = 0; i < trackIdx; i++) {
-            if (adp.tracks[i]?.pending) {
-                log(`⚠️  OUT OF ORDER: #${trackIdx} done but #${i} still pending! ("${adp.tracks[i].text.substring(0, 40)}")`);
-            }
-        }
 
         log(`done #${trackIdx} msg=${msgId} ${placeholder.duration.toFixed(1)}s "${text.substring(0, 40)}"`);
         refreshPlaylistUi();
@@ -644,7 +677,7 @@ function stopPeriodicTimer() {
 
 // Flush any remaining text in the global buffer as a track
 function flushBuffer() {
-    const text = adp.textBuffer.trim();
+    const text = adp.textBuffer.trimStart();
     if (text.length > 0 && adp.lastMsgId != null) {
         adpGenerateAndPlay(adp.lastMsgId, text, adp.bufferIsUser, adp.bufferCharName);
         adp.textBuffer = '';
@@ -775,9 +808,14 @@ const ST_CHECKBOXES = [
 
 let stSettingsSaved = null;
 
+function isPocketTtsSelected() {
+    const es = window.extension_settings || extension_settings;
+    return es?.tts?.currentProvider === 'PocketTTS WebSocket';
+}
+
 function isPocketTtsActive() {
     const es = window.extension_settings || extension_settings;
-    return es?.tts?.currentProvider === 'PocketTTS WebSocket' && es?.tts?.enabled === true;
+    return isPocketTtsSelected() && es?.tts?.enabled === true;
 }
 
 function disableStTts() {
@@ -817,7 +855,7 @@ function enableStTts() {
 
 function onProviderDropdownChange() {
     clearHighlight();
-    if (isPocketTtsActive()) disableStTts();
+    if (isPocketTtsSelected()) disableStTts();
     else enableStTts();
 }
 
@@ -850,6 +888,8 @@ function onGenerationEnded() {
     } else {
         log('gen end');
     }
+    // Signal server to flush merge queue
+    window._pttsProvider?.sendTextDone();
     adp.active = false;
     stopPeriodicTimer();
 }
@@ -872,13 +912,16 @@ export function onActivate() {
         }
     }
 
-    $('#tts_provider').on('change', onProviderDropdownChange);
-    if (isPocketTtsActive()) disableStTts();
+    $('#tts_provider').on('change.ptts', onProviderDropdownChange);
+    // Disable ST TTS if PocketTTS is selected — check both saved setting AND dropdown value
+    // (dropdown may already have the value from a previous session even if settings aren't loaded yet)
+    const pocketTtsIsSelected = isPocketTtsSelected() || (select && select.value === 'PocketTTS WebSocket');
+    if (pocketTtsIsSelected) disableStTts();
 
-    initTtsBar(extension_settings);
+    ttsBarCleanup = initTtsBar(extension_settings);
 
     // Override narrate button — handle directly with PocketTTS
-    $(document).on('click', '.mes_narrate', function (e) {
+    $(document).on('click.ptts', '.mes_narrate', function (e) {
         if (!isPocketTtsActive()) return; // let ST handle it
         e.stopImmediatePropagation();
         e.preventDefault();
@@ -917,4 +960,24 @@ export function onActivate() {
         nukePlaylist();
         window._pttsProvider?.dispose();
     });
+}
+
+export function onDeactivate() {
+    // Remove namespaced event listeners
+    $('#tts_provider').off('change.ptts');
+    $(document).off('click.ptts', '.mes_narrate');
+    eventSource.off(event_types.GENERATION_STARTED, onGenerationStarted);
+    eventSource.off(event_types.GENERATION_ENDED, onGenerationEnded);
+    eventSource.off(event_types.GENERATION_STOPPED, onGenerationEnded);
+    eventSource.off(event_types.MESSAGE_SWIPED, onSwipe);
+
+    // Clean up state
+    stopPeriodicTimer();
+    nukePlaylist();
+    clearHighlight();
+    enableStTts();
+    ttsBarCleanup?.();
+    window._pttsProvider?.dispose();
+    delete window._pttsProvider;
+    delete window._pttsAudio;
 }

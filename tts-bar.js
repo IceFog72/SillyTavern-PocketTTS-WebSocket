@@ -2,6 +2,7 @@
 
 export function initTtsBar(extSettings) {
     const bar = createBarElements();
+    const intervals = [];
 
     let audio = null;
     let seeking = false;
@@ -33,7 +34,7 @@ export function initTtsBar(extSettings) {
         setTimeout(updateBarVisibility, 200);
     });
 
-    setInterval(() => { updateBarVisibility(); updateHighlightBtn(); }, 1000);
+    intervals.push(setInterval(() => { updateBarVisibility(); updateHighlightBtn(); }, 1000));
     updateBarVisibility();
     updateHighlightBtn();
 
@@ -91,7 +92,7 @@ export function initTtsBar(extSettings) {
         }
     }
 
-    setInterval(scanAudioElements, 1000);
+    intervals.push(setInterval(scanAudioElements, 1000));
     scanAudioElements();
 
     // ─── Playback state ──────────────────────────────────
@@ -313,6 +314,11 @@ export function initTtsBar(extSettings) {
     window._pttsRefreshPlaylist = renderPlaylist;
 
     console.debug('[tts-pl] Player bar initialized');
+
+    // Return cleanup function
+    return () => {
+        for (const id of intervals) clearInterval(id);
+    };
 }
 
 // ─── DOM creation ──────────────────────────────────────

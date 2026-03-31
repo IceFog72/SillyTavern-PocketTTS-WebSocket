@@ -22,6 +22,8 @@ class PocketTtsProvider {
     static MAX_DONE_BUFFER = 10; // limit to prevent memory leak
     // Raw audio chunk buffer — accumulated between requests, claimed on 'done'
     _audioChunks = [];
+    // Track cancelled/timed-out request IDs to discard late chunks
+    _cancelledIds = new Set();
     // Send queue: ensures text goes to server in order (sequential IDs)
     // Sends fire-and-forget — doesn't wait for response
     _sendQueue = [];
@@ -291,7 +293,7 @@ class PocketTtsProvider {
         pending.timeout = setTimeout(() => {
             const idx = this._wsPending.indexOf(pending);
             if (idx >= 0) {
-                this._audioChunks = []; // discard orphaned chunks from timed-out request
+                this._cancelledIds.add(pending.id);
                 if (this._retryRequest(pending, 'timeout')) {
                     return; // retry scheduled
                 }
@@ -302,6 +304,7 @@ class PocketTtsProvider {
 
         // Push to send queue — maintains text order
         const payload = {
+            type: 'text.append',
             request_id: reqId,
             text: trimmed,
             voice: voiceId,
@@ -331,6 +334,16 @@ class PocketTtsProvider {
         while (this._sendQueue.length > 0) {
             const payload = this._sendQueue.shift();
             this._worker.postMessage({ type: 'send', payload });
+        }
+    }
+
+    /**
+     * Send text.done to signal end of generation.
+     * Server flushes merge queue and sends session_ended when complete.
+     */
+    sendTextDone() {
+        if (this._worker) {
+            this._worker.postMessage({ type: 'send', payload: { type: 'text.done' } });
         }
     }
 
@@ -379,6 +392,15 @@ class PocketTtsProvider {
         if (type === 'status') {
             this._workerReady = connected;
             this._updateStatus(this.ready);
+            // On disconnect, reject all pending requests so the client doesn't hang
+            if (!connected) {
+                for (const p of this._wsPending) {
+                    clearTimeout(p.timeout);
+                    p.promise._reject(new Error('WebSocket disconnected'));
+                }
+                this._wsPending = [];
+                this._audioChunks = [];
+            }
             return;
         }
 
@@ -458,6 +480,12 @@ class PocketTtsProvider {
                 return;
             }
 
+            if (msg.status === 'session_ended') {
+                console.log('[tts-pl] session ended');
+                this._updateStatus(this.ready);
+                return;
+            }
+
             // Other JSON — ignore
             return;
         }
@@ -488,6 +516,8 @@ class PocketTtsProvider {
         this._wsPending = [];
         this._audioChunks = [];
         this._sendQueue = [];
+        this._doneBuffer.clear();
+        this._cancelledIds.clear();
     }
 
     _getWsUrl() {
@@ -510,7 +540,10 @@ class PocketTtsProvider {
 
     // ─── Preview ───────────────────────────────────────────────────
 
+    _previewAbort = false;
+
     async previewTtsVoice(voiceId) {
+        this._previewAbort = true; // cancel any in-flight preview
         this.audioElement.pause();
         this.audioElement.currentTime = 0;
         // Revoke previous blob URL if any
@@ -519,9 +552,13 @@ class PocketTtsProvider {
             this._previewUrl = null;
         }
         const text = getPreviewString('en-US');
+        const thisPreview = {}; // unique reference per call
+        this._previewAbort = false;
         try {
             for await (const blobPromise of this.generateTts(text, voiceId)) {
+                if (this._previewAbort) return; // cancelled by newer preview
                 const blob = await blobPromise;
+                if (this._previewAbort) return;
                 const url = URL.createObjectURL(blob);
                 this._previewUrl = url;
                 this.audioElement.src = url;
@@ -544,6 +581,12 @@ class PocketTtsProvider {
         this._wsPending = [];
         this._doneBuffer.clear();
         this._audioChunks = [];
+        this._cancelledIds.clear();
+        this._previewAbort = true;
+        if (this._previewUrl) {
+            URL.revokeObjectURL(this._previewUrl);
+            this._previewUrl = null;
+        }
         this._closeWorker();
     }
 }

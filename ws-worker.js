@@ -20,10 +20,13 @@ function connect() {
         reconnectAttempts = 0;
         postMessage({ type: 'status', connected: true });
         // Flush any messages that were buffered during disconnect
-        for (const msg of pendingSends) {
-            try { ws.send(JSON.stringify(msg)); } catch {}
-        }
+        const toSend = pendingSends;
         pendingSends = [];
+        for (const msg of toSend) {
+            try { ws.send(JSON.stringify(msg)); } catch {
+                pendingSends.push(msg);
+            }
+        }
     };
 
     ws.onmessage = (event) => {
