@@ -870,6 +870,14 @@ function onGenerationStarted(generationType, _args, isDryRun) {
         nukePlaylist();
     }
 
+    // Clear stale audio chunks from previous generation that may not have
+    // received a 'done' message — prevents them from being merged with new audio
+    const provider = window._pttsProvider;
+    if (provider) {
+        provider._audioChunks = [];
+        provider._cancelledIds.clear();
+    }
+
     adp.active = true;
     adp.textBuffer = '';
     lastSearchOffset = 0;

@@ -299,8 +299,8 @@ class PocketTtsProvider {
                 }
                 this._wsPending.splice(idx, 1);
             }
-            blobPromise._reject(new Error('TTS timeout (30s)'));
-        }, 30000);
+            blobPromise._reject(new Error('TTS timeout (60s)'));
+        }, 60000);
 
         // Push to send queue — maintains text order
         const payload = {
@@ -373,8 +373,8 @@ class PocketTtsProvider {
                 const idx = this._wsPending.indexOf(pending);
                 if (this._retryRequest(pending, 'timeout')) return;
                 if (idx >= 0) this._wsPending.splice(idx, 1);
-                pending.promise._reject(new Error('TTS timeout (30s)'));
-            }, 30000);
+                pending.promise._reject(new Error('TTS timeout (60s)'));
+            }, 60000);
 
             // Re-send with retry flag
             const retryPayload = { ...pending.payload, retry: true };
