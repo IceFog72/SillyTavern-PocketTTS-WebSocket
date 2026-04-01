@@ -126,16 +126,32 @@ pttsAudio.id = 'ptts_audio';
 // TreeWalker visits each text node, and we build a map of [{node, start, end}]
 // so we can split and wrap arbitrary ranges.
 //
+// WHY block-boundary space injection: when the DOM has <p>Hello.</p><p>World</p>,
+// concatenating text nodes gives "Hello.World" — no space between blocks.
+// But the TTS text (from markdown) has "Hello. World" (newline → space).
+// We insert a virtual space at each block boundary so the concatenated text
+// matches what the TTS text looks like after normalization.
+//
 // WHY substring search (not word-stripping): earlier versions stripped words
 // from the playing text and searched for them individually. This broke
 // contractions ("You're" → "youre" wouldn't match "you're" in the DOM).
 // Substring search preserves the original text, including contractions.
 
 let highlightEnabled = localStorage.getItem('ptts-highlight') === 'true';
-let lastSearchOffset = 0; // search starts from last match position (sequential playback)
+// Tracks search position in original (non-normalized) DOM text space.
+// Reset when message changes (_lastHighlightMsgId).
+let lastSearchOffset = 0;
 
 let highlightLayer = null;
 let highlightContainer = null;
+
+// Block-level tags that create visual line/paragraph breaks.
+// When a text node follows one of these, there's an implicit space in the
+// rendered output that doesn't exist as a text node.
+const BLOCK_TAGS = new Set([
+    'P', 'DIV', 'BR', 'LI', 'OL', 'UL', 'BLOCKQUOTE',
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TR', 'PRE', 'HR',
+]);
 
 // Creates or returns the highlight overlay for a message element.
 // The overlay copies font styles from the original to ensure alignment.
@@ -195,7 +211,79 @@ function clearHighlight() {
     highlightContainer = null;
 }
 
-// Map position in normalized (whitespace-collapsed) text back to original position
+// Check if a node is preceded by a block-level element boundary.
+// Used to inject virtual spaces between block elements in the text map.
+function _needsBlockSpace(textNode) {
+    // Walk backwards through siblings and parents to see if we just left a block
+    let node = textNode;
+    while (node) {
+        const prev = node.previousSibling;
+        if (prev) {
+            // Previous sibling is a block element → space needed
+            if (prev.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has(prev.tagName)) return true;
+            // Previous sibling is an element that CONTAINS block elements at its end
+            if (prev.nodeType === Node.ELEMENT_NODE) {
+                const last = prev.lastElementChild;
+                if (last && BLOCK_TAGS.has(last.tagName)) return true;
+            }
+            return false;
+        }
+        // No previous sibling — check if parent itself is a block element
+        node = node.parentElement;
+        if (node && BLOCK_TAGS.has(node.tagName)) return true;
+    }
+    return false;
+}
+
+// Build text-node map from a layer element.
+// Returns { nodes: [{node, start, end}], fullText: string }
+// Handles block boundaries by injecting virtual spaces.
+function buildTextMap(layer) {
+    const nodes = [];
+    let fullText = '';
+    const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT, null, false);
+    let nd;
+    let isFirst = true;
+
+    while ((nd = walker.nextNode())) {
+        // Inject a space at block boundaries (except before the very first node)
+        if (!isFirst && _needsBlockSpace(nd)) {
+            // Only inject if fullText doesn't already end with whitespace
+            if (fullText.length > 0 && !/\s$/.test(fullText)) {
+                fullText += ' ';
+            }
+        }
+        isFirst = false;
+
+        const len = nd.textContent.length;
+        nodes.push({ node: nd, start: fullText.length, end: fullText.length + len });
+        fullText += nd.textContent;
+    }
+
+    return { nodes, fullText };
+}
+
+// Strip markdown formatting from TTS text to match rendered DOM.
+// TTS gets `code` but DOM has <code>code</code> — backticks don't exist in DOM.
+// TTS gets **bold** but DOM has <strong>bold</strong>, etc.
+// Also strips orphan quote marks that appear at sentence boundaries when
+// <q> elements split across sentences.
+function stripMd(s) {
+    return s
+        .replace(/`{1,3}/g, '')              // backticks → <code>
+        .replace(/\*\*(.+?)\*\*/g, '$1')     // **bold** → <strong>
+        .replace(/\*(.+?)\*/g, '$1')         // *italic* → <em>
+        .replace(/~~(.+?)~~/g, '$1')         // ~~strike~~ → <del>
+        .replace(/^["'"'\u201c\u201d\u2018\u2019]+/, '')  // leading orphan quotes
+        .replace(/["'"'\u201c\u201d\u2018\u2019]+$/, ''); // trailing orphan quotes
+}
+
+// Normalize whitespace — collapse runs of whitespace to single space.
+// DOM may have newlines from HTML structure or injected block-boundary spaces.
+const normalize = (s) => s.replace(/\s+/g, ' ');
+
+// Map a position in normalized (whitespace-collapsed) text back to the
+// corresponding position in the original text.
 function mapNormalizedPos(original, normPos) {
     let oi = 0, ni = 0;
     let inWhitespace = false;
@@ -209,6 +297,22 @@ function mapNormalizedPos(original, normPos) {
         oi++;
     }
     return oi;
+}
+
+// Map a position in original text to its corresponding normalized position.
+// Inverse of mapNormalizedPos.
+function mapOrigToNormPos(original, origPos) {
+    let ni = 0;
+    let inWhitespace = false;
+    for (let oi = 0; oi < origPos && oi < original.length; oi++) {
+        if (/\s/.test(original[oi])) {
+            if (!inWhitespace) { ni++; inWhitespace = true; }
+        } else {
+            ni++;
+            inWhitespace = false;
+        }
+    }
+    return ni;
 }
 
 function highlightForText(playingText, msgId) {
@@ -228,49 +332,48 @@ function highlightForText(playingText, msgId) {
     }
     layer.style.display = 'block';
 
-    // Build text node map: [{node, start, end}, ...]
-    const nodes = [];
-    let fullText = '';
-    const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT, null, false);
-    let nd;
-    while ((nd = walker.nextNode())) {
-        const len = nd.textContent.length;
-        nodes.push({ node: nd, start: fullText.length, end: fullText.length + len });
-        fullText += nd.textContent;
-    }
+    // Build text node map with block-boundary space injection
+    const { nodes, fullText } = buildTextMap(layer);
     if (fullText.length === 0) return;
 
-    // Strip markdown formatting from TTS text to match rendered DOM
-    // TTS gets `code` but DOM has <code>code</code> — backticks don't exist in DOM
-    const stripMd = (s) => s
-        .replace(/`{1,3}/g, '')  // remove backticks
-        .replace(/\*\*(.+?)\*\*/g, '$1')  // bold
-        .replace(/\*(.+?)\*/g, '$1')      // italic
-        .replace(/~~(.+?)~~/g, '$1');      // strikethrough
-
-    // Normalize whitespace — DOM may have newlines from HTML structure
-    const normalize = (s) => s.replace(/\s+/g, ' ');
-
-    // Search for original playing text as substring (preserves contractions like You're, I'll)
+    // Normalize both DOM text and search text for comparison
     const lowerFull = normalize(fullText.toLowerCase());
     const search = normalize(stripMd(playingText.trim().toLowerCase()));
     if (!search) return;
 
-    let pos = lowerFull.indexOf(search, lastSearchOffset);
+    // Convert lastSearchOffset from original-text space to normalized space
+    // so we can search in normalized space correctly.
+    const normOffset = mapOrigToNormPos(fullText, lastSearchOffset);
+
+    let pos = lowerFull.indexOf(search, normOffset);
     if (pos < 0) pos = lowerFull.indexOf(search, 0);
     let matchedLen = search.length;
 
     // Fallback: ST may have modified the DOM (removed reasoning, applied regex),
-    // so the full playing text no longer exists as a substring. Try matching
-    // the longest suffix starting at a sentence boundary — the end of the chunk
-    // is most likely to still exist in the DOM.
+    // so the full playing text no longer exists as a substring.
+    // Strategy: try progressively shorter chunks from both ends.
     if (pos < 0) {
+        // Try longest suffix starting at sentence boundaries
         const parts = search.split(/(?<=[.!?…])\s+/);
         for (let i = 0; i < parts.length; i++) {
             const suffix = parts.slice(i).join(' ');
             if (suffix.length < 10) break;
-            const found = lowerFull.indexOf(suffix);
+            const found = lowerFull.indexOf(suffix, normOffset);
             if (found >= 0) { pos = found; matchedLen = suffix.length; break; }
+            // Also try without offset constraint
+            const found2 = lowerFull.indexOf(suffix, 0);
+            if (found2 >= 0) { pos = found2; matchedLen = suffix.length; break; }
+        }
+        // Try longest prefix
+        if (pos < 0) {
+            for (let i = parts.length; i > 0; i--) {
+                const prefix = parts.slice(0, i).join(' ');
+                if (prefix.length < 10) break;
+                const found = lowerFull.indexOf(prefix, normOffset);
+                if (found >= 0) { pos = found; matchedLen = prefix.length; break; }
+                const found2 = lowerFull.indexOf(prefix, 0);
+                if (found2 >= 0) { pos = found2; matchedLen = prefix.length; break; }
+            }
         }
         // Last resort: try last half of text
         if (pos < 0 && search.length > 20) {
@@ -279,14 +382,21 @@ function highlightForText(playingText, msgId) {
             if (found >= 0) { pos = found; matchedLen = half.length; }
         }
     }
-    if (pos < 0) return;
+    if (pos < 0) {
+        log(`highlight: no match for "${search.substring(0, 40)}" in msg=${msgId}`);
+        return;
+    }
 
-    // Map normalized position back to original text position
+    // Map normalized match positions back to original text positions
     const matchStart = mapNormalizedPos(fullText, pos);
     const matchEnd = mapNormalizedPos(fullText, pos + matchedLen);
-    lastSearchOffset = pos + matchedLen;
 
-    // Wrap matching text nodes in <mark> — safe even across HTML element boundaries
+    // Track offset in ORIGINAL text space (not normalized).
+    // This prevents drift from accumulating across calls.
+    lastSearchOffset = matchEnd;
+
+    // Wrap matching text nodes in <mark> — safe even across HTML element boundaries.
+    // Iterate in reverse so splitText doesn't invalidate subsequent node offsets.
     for (let i = nodes.length - 1; i >= 0; i--) {
         const { node: tNode, start: ns, end: ne } = nodes[i];
         const ws = Math.max(matchStart, ns);
