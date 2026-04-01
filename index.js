@@ -25,8 +25,8 @@ import { extension_settings } from '../../../extensions.js';
 import { PocketTtsProvider } from './pocket-tts.js';
 import { initTtsBar } from './tts-bar.js';
 
-// All console output prefixed [tts-pl] for easy filtering in devtools
-const log = (...args) => console.log('[tts-pl]', ...args);
+// All console output prefixed [pocketTTS-WS] for easy filtering in devtools
+const log = (...args) => console.log('[pocketTTS-WS]', ...args);
 
 // ─── State ─────────────────────────────────────────────────────────
 
@@ -802,7 +802,7 @@ function onTick() {
         log(`[tts] skip user msg: narrate_user=${extension_settings.tts.narrate_user}`);
         return;
     }
-    if (!lastMsg.mes && lastMsg.mes !== '') return;
+    if (lastMsg.mes == null) return;
 
     adp.isUserMsg = !!lastMsg.is_user;
     adp.msgCharName = lastMsg.name || (lastMsg.is_user ? context.name1 : context.name2);

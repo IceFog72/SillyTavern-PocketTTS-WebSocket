@@ -313,7 +313,7 @@ export function initTtsBar(extSettings) {
     // Event-driven: index.js calls this when playlist changes
     window._pttsRefreshPlaylist = renderPlaylist;
 
-    console.debug('[tts-pl] Player bar initialized');
+    console.debug('[pocketTTS-WS] Player bar initialized');
 
     // Return cleanup function
     return () => {

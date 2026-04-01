@@ -346,6 +346,7 @@ class PocketTtsProvider {
      * Called after each generateTts push and after each done/error received.
      */
     _flushSendQueue() {
+        if (!this._worker) return;
         while (this._sendQueue.length > 0) {
             const payload = this._sendQueue.shift();
             this._worker.postMessage({ type: 'send', payload });
@@ -373,7 +374,7 @@ class PocketTtsProvider {
         pending.retryCount++;
         pending.chunks = [];
 
-        console.log('[tts-pl] retry %d/%d for %s in %dms (%s)',
+        console.log('[pocketTTS-WS] retry %d/%d for %s in %dms (%s)',
             pending.retryCount, PocketTtsProvider.MAX_RETRIES,
             pending.id, delay, reason);
 
@@ -393,7 +394,9 @@ class PocketTtsProvider {
 
             // Re-send with retry flag
             const retryPayload = { ...pending.payload, retry: true };
-            this._worker.postMessage({ type: 'send', payload: retryPayload });
+            if (this._worker) {
+                this._worker.postMessage({ type: 'send', payload: retryPayload });
+            }
         }, delay);
 
         return true;
@@ -449,12 +452,12 @@ class PocketTtsProvider {
                             const blob = new Blob(chunks, { type: this._getMimeType() });
                             p.promise._resolve(blob);
                         } else {
-                            console.log('[tts-pl] merged: %s absorbed into %s', rid, doneIds[0]);
+                            console.log('[pocketTTS-WS] merged: %s absorbed into %s', rid, doneIds[0]);
                             p.promise._resolve(null);
                         }
                     } else {
                         // Promise not created yet — buffer the response
-                        console.log('[tts-pl] buffered early response for %s (%d chunks)', rid, chunks.length);
+                        console.log('[pocketTTS-WS] buffered early response for %s (%d chunks)', rid, chunks.length);
                         this._doneBuffer.set(rid, { chunks: di === 0 ? chunks : [], timing, merged: di > 0 });
                         // Evict oldest entries if buffer grows too large
                         while (this._doneBuffer.size > PocketTtsProvider.MAX_DONE_BUFFER) {
@@ -489,14 +492,14 @@ class PocketTtsProvider {
                     }
                 }
                 if (!errIds.length) {
-                    console.log('[tts-pl] worker error:', error || msg?.error);
+                    console.log('[pocketTTS-WS] worker error:', error || msg?.error);
                 }
                 this._updateStatus(this.ready);
                 return;
             }
 
             if (msg.status === 'session_ended') {
-                console.log('[tts-pl] session ended');
+                console.log('[pocketTTS-WS] session ended');
                 this._updateStatus(this.ready);
                 return;
             }
@@ -585,7 +588,7 @@ class PocketTtsProvider {
                 return;
             }
         } catch (err) {
-            console.error('[tts-pl] preview error:', err);
+            console.error('[pocketTTS-WS] preview error:', err);
         }
     }
 
