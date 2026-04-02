@@ -11,7 +11,7 @@
 //
 // Data flow:
 //   chat[mes].mes (streaming text from ST)
-//     → timer (250ms) reads new chars
+//     → timer (500ms) reads new chars
 //     → processNewText() appends to textBuffer
 //     → splitSentences() on sentence boundaries (. ! ? …)
 //     → adpGenerateAndPlay() creates placeholder in tracks[], sends WS request
@@ -42,7 +42,7 @@ const adp = {
     playingIdx: -1,        // index into tracks[] of currently playing track (-1 = none)
     playingTrack: null,    // text of track currently playing (used for highlighting after cleanup)
     isPlaying: false,
-    timer: null,           // 250ms interval that reads chat[mes].mes
+    timer: null,           // 500ms interval that reads chat[mes].mes
     active: false,         // true during generation — timer only runs when active
     textBuffer: '',        // accumulates chars from streaming text until sentence boundary found
     lastMsgId: null,       // current message being streamed — used to detect new message / swipe
@@ -850,7 +850,7 @@ async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '') {
 
 function startPeriodicTimer() {
     stopPeriodicTimer();
-    adp.timer = setInterval(onTick, 250);
+    adp.timer = setInterval(onTick, 500);
 }
 
 function stopPeriodicTimer() {
