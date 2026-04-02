@@ -63,7 +63,8 @@ const adp = {
 // punctuation (parens only) then whitespace.
 // The \s+ ensures we only split at actual word boundaries, not mid-word.
 // NOTE: quotes removed from closing chars — they cause corruption when splitting quoted dialogue.
-const SENTENCE_END = /[.!?…][)]*\s+/g;
+// Don't split when punctuation is inside quotes to preserve dialogue.
+const SENTENCE_END = /(?<![""'"'\u201c\u201d\u2018\u2019])[.!?…][)]*\s+/g;
 
 function splitSentences(text) {
     const result = [];
@@ -163,7 +164,14 @@ function ensureHighlightLayer(msgId) {
     if (mesEl.closest('.smallSysMes')) return null;
 
     if (mesEl.parentElement.classList.contains('ptts-highlight-wrap')) {
-        return highlightLayer;
+        // Wrap exists but highlightLayer may be stale — rebuild it
+        highlightLayer = mesEl.parentElement.querySelector('.ptts-highlight-layer');
+        if (highlightLayer) {
+            highlightContainer = mesEl.parentElement;
+            return highlightLayer;
+        }
+        // Layer is missing despite wrap existing — fall through to recreate
+        mesEl.parentElement.remove();
     }
 
     const mesStyle = window.getComputedStyle(mesEl);
@@ -190,6 +198,9 @@ function ensureHighlightLayer(msgId) {
     layer.style.textAlign = mesStyle.textAlign;
     layer.style.textIndent = mesStyle.textIndent;
     layer.style.margin = '0';
+    layer.style.padding = '0';
+    layer.style.width = mesStyle.width;
+    layer.style.boxSizing = mesStyle.boxSizing;
 
     wrap.appendChild(layer);
     highlightContainer = wrap;
@@ -209,6 +220,17 @@ function clearHighlight() {
     }
     highlightLayer = null;
     highlightContainer = null;
+}
+
+// Clear only the <mark> elements without tearing down the entire highlight layer.
+// More efficient for same-message sentence transitions.
+function clearMarksOnly() {
+    if (!highlightLayer) return;
+    const marks = highlightLayer.querySelectorAll('.ptts-hl-active');
+    marks.forEach(m => {
+        m.replaceWith(...m.childNodes);
+    });
+    highlightLayer.normalize(); // merge adjacent text nodes
 }
 
 // Check if a node is preceded by a block-level element boundary.
@@ -279,8 +301,12 @@ function stripMd(s) {
 }
 
 // Normalize whitespace — collapse runs of whitespace to single space.
+// Also normalize Unicode curly quotes to ASCII for matching.
 // DOM may have newlines from HTML structure or injected block-boundary spaces.
-const normalize = (s) => s.replace(/\s+/g, ' ');
+const normalize = (s) => s
+    .replace(/\s+/g, ' ')
+    .replace(/[\u2018\u2019\u201a\u201b]/g, "'")   // curly single quotes → straight
+    .replace(/[\u201c\u201d\u201e\u201f]/g, '"');   // curly double quotes → straight
 
 // Map a position in normalized (whitespace-collapsed) text back to the
 // corresponding position in the original text.
@@ -316,7 +342,12 @@ function mapOrigToNormPos(original, origPos) {
 }
 
 function highlightForText(playingText, msgId) {
-    clearHighlight();
+    // Use lightweight mark clearing for same-message transitions
+    if (_lastHighlightMsgId === msgId && highlightLayer) {
+        clearMarksOnly();
+    } else {
+        clearHighlight();
+    }
     if (!highlightEnabled || !playingText) return;
 
     const mesEl = msgId != null
@@ -338,7 +369,8 @@ function highlightForText(playingText, msgId) {
 
     // Normalize both DOM text and search text for comparison
     const lowerFull = normalize(fullText.toLowerCase());
-    const search = normalize(stripMd(playingText.trim().toLowerCase()));
+    const search = normalize(stripMd(playingText.trim().toLowerCase()))
+        .replace(/\.{3,}/g, '\u2026');   // ... → … to match what ST's MD renderer produces
     if (!search) return;
 
     // Convert lastSearchOffset from original-text space to normalized space
