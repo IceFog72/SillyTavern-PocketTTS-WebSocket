@@ -41,16 +41,40 @@ export function initTtsBar(extSettings) {
     // Track whichever audio element is currently playing
     let boundElements = new Set();
 
+    // Fix #6: Store event handler references for cleanup
+    const audioEventHandlers = {
+        play: (el) => () => { switchTo(el); updateState(); },
+        playing: (el) => () => { switchTo(el); updateState(); },
+        pause: () => updateState,
+        ended: () => updateState,
+        timeupdate: () => updateTime,
+        loadedmetadata: () => updateDuration,
+        volumechange: () => updateVol,
+    };
+
     function bindAudio(el) {
         if (!el || boundElements.has(el)) return;
         boundElements.add(el);
-        el.addEventListener('play', () => { switchTo(el); updateState(); });
-        el.addEventListener('playing', () => { switchTo(el); updateState(); });
-        el.addEventListener('pause', updateState);
-        el.addEventListener('ended', updateState);
-        el.addEventListener('timeupdate', updateTime);
-        el.addEventListener('loadedmetadata', updateDuration);
-        el.addEventListener('volumechange', updateVol);
+        el.addEventListener('play', audioEventHandlers.play(el));
+        el.addEventListener('playing', audioEventHandlers.playing(el));
+        el.addEventListener('pause', audioEventHandlers.pause());
+        el.addEventListener('ended', audioEventHandlers.ended());
+        el.addEventListener('timeupdate', audioEventHandlers.timeupdate());
+        el.addEventListener('loadedmetadata', audioEventHandlers.loadedmetadata());
+        el.addEventListener('volumechange', audioEventHandlers.volumechange());
+    }
+
+    // Fix #6: Function to unbind audio elements
+    function unbindAudio(el) {
+        if (!el || !boundElements.has(el)) return;
+        el.removeEventListener('play', audioEventHandlers.play(el));
+        el.removeEventListener('playing', audioEventHandlers.playing(el));
+        el.removeEventListener('pause', audioEventHandlers.pause());
+        el.removeEventListener('ended', audioEventHandlers.ended());
+        el.removeEventListener('timeupdate', audioEventHandlers.timeupdate());
+        el.removeEventListener('loadedmetadata', audioEventHandlers.loadedmetadata());
+        el.removeEventListener('volumechange', audioEventHandlers.volumechange());
+        boundElements.delete(el);
     }
 
     function switchTo(el) {
@@ -253,7 +277,7 @@ export function initTtsBar(extSettings) {
         pointerId = e.pointerId;
         startClientY = e.clientY;
         startHeight = bar.el.offsetHeight;
-        try { bar.splitter.setPointerCapture(pointerId); } catch (e) { }
+        try { bar.splitter.setPointerCapture(pointerId); } catch (_err) { }
         document.body.style.userSelect = 'none';
         window.addEventListener('pointermove', onPointerMove);
         window.addEventListener('pointerup', onPointerUp);
@@ -267,7 +291,7 @@ export function initTtsBar(extSettings) {
 
     function onPointerUp(e) {
         if (pointerId !== null && e.pointerId === pointerId) {
-            try { bar.splitter.releasePointerCapture(pointerId); } catch (e) { }
+            try { bar.splitter.releasePointerCapture(pointerId); } catch (_err) { }
         }
         pointerId = null;
         document.body.style.userSelect = '';
@@ -315,9 +339,22 @@ export function initTtsBar(extSettings) {
 
     console.debug('[pocketTTS-WS] Player bar initialized');
 
-    // Return cleanup function
+    // Fix #6: Return comprehensive cleanup function
     return () => {
+        // Clear intervals
         for (const id of intervals) clearInterval(id);
+        
+        // Unbind audio elements
+        for (const el of boundElements) {
+            unbindAudio(el);
+        }
+        
+        // Remove window._pttsRefreshPlaylist
+        delete window._pttsRefreshPlaylist;
+        
+        // Remove bar DOM elements
+        if (bar.el.parentNode) bar.el.parentNode.removeChild(bar.el);
+        if (bar.splitter.parentNode) bar.splitter.parentNode.removeChild(bar.splitter);
     };
 }
 
@@ -354,16 +391,16 @@ function createBarElements() {
     splitter.className = 'ptts-splitter';
     splitter.style.display = 'none';
 
-    // Insert bar + splitter before #chat (bar above, splitter below)
+    // Fix #12: Insert bar + splitter in correct order (bar above, splitter below bar)
     const chat = document.getElementById('chat');
     if (chat) {
         chat.before(el);
-        chat.before(splitter);
+        el.after(splitter); // splitter right after bar, not before chat
     } else {
         const formSheld = document.getElementById('form_sheld');
         if (formSheld) {
             formSheld.before(el);
-            formSheld.before(splitter);
+            el.after(splitter);
         } else {
             document.body.appendChild(el);
             document.body.appendChild(splitter);

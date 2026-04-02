@@ -29,7 +29,7 @@ Single persistent connection to `/v1/audio/stream`. Requests are fire-and-forget
 
 ### Highlighting
 
-Text highlighting uses substring search against rendered DOM.
+Text highlighting uses substring search against rendered DOM with Unicode normalization for quotes and ellipsis characters.
 
 ## Settings
 
@@ -42,7 +42,7 @@ Text highlighting uses substring search against rendered DOM.
 | Temperature | `1.0` | 0.0–2.0 |
 | Top P | `1.0` | 0.0–1.0 |
 
-Voice mapping: SillyTavern's TTS Voice Map section.
+Voice mapping: SillyTavern's TTS Voice Map section.s
 
 ## Feedback
 

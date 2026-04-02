@@ -27,10 +27,12 @@ import { initTtsBar } from './tts-bar.js';
 
 // All console output prefixed [pocketTTS-WS] for easy filtering in devtools
 const log = (...args) => console.log('[pocketTTS-WS]', ...args);
+const logDebug = (...args) => console.debug('[pocketTTS-WS]', ...args);
 
 // ─── State ─────────────────────────────────────────────────────────
 
 let ttsBarCleanup = null;
+let nextTrackId = 0; // unique ID for each track
 
 const adp = {
     // WHY flat array: tracks are ordered by text arrival = play order.
@@ -64,7 +66,8 @@ const adp = {
 // The \s+ ensures we only split at actual word boundaries, not mid-word.
 // NOTE: quotes removed from closing chars — they cause corruption when splitting quoted dialogue.
 // Don't split when punctuation is inside quotes to preserve dialogue.
-const SENTENCE_END = /(?<![""'"'\u201c\u201d\u2018\u2019])[.!?…][)]*\s+/g;
+// Fix #14: Cleaned up regex character class — removed redundant characters.
+const SENTENCE_END = /(?<![""\u201c\u201d\u2018\u2019'])[.!?…][)]*\s+/g;
 
 function splitSentences(text) {
     const result = [];
@@ -103,7 +106,11 @@ function getVoiceId(isUserMessage = false, charName = null) {
     let voiceId = voiceMap[name];
     // Fallback for user messages: try "User" if actual name not found
     if (!voiceId && isUserMessage) voiceId = voiceMap['User'];
-    if (voiceId === '[Default Voice]') voiceId = voiceMap['[Default Voice]'];
+    // Fix #13: Avoid circular fallback where voiceMap['[Default Voice]'] === '[Default Voice]'
+    if (voiceId === '[Default Voice]') {
+        const defaultVoice = voiceMap['[Default Voice]'];
+        voiceId = (defaultVoice && defaultVoice !== '[Default Voice]') ? defaultVoice : null;
+    }
     if (!voiceId || voiceId === 'disabled') {
         voiceId = voiceMap['[Default Voice]'] || provider?.settings?.voice || 'nova';
     }
@@ -170,8 +177,14 @@ function ensureHighlightLayer(msgId) {
             highlightContainer = mesEl.parentElement;
             return highlightLayer;
         }
-        // Layer is missing despite wrap existing — fall through to recreate
-        mesEl.parentElement.remove();
+        // Fix #7: Layer is missing despite wrap existing — unwrap mes_text first, then remove empty wrap
+        const wrap = mesEl.parentElement;
+        if (wrap.parentNode) {
+            wrap.parentNode.insertBefore(mesEl, wrap);
+            mesEl.style.margin = '';
+            mesEl.style.padding = '';
+        }
+        wrap.remove();
     }
 
     const mesStyle = window.getComputedStyle(mesEl);
@@ -647,10 +660,14 @@ function nukeMsgTracks(msgId) {
     }
 
     // Recalculate playingIdx in new array
+    // Fix #4: Use trackId for unique matching instead of .text
     if (adp.playingIdx >= 0 && adp.isPlaying) {
-        // Find the playing track's text in remaining
-        const playingText = adp.playingTrack;
-        adp.playingIdx = remaining.findIndex(t => t.text === playingText);
+        const playingTrackId = adp.tracks[adp.playingIdx]?.trackId;
+        if (playingTrackId != null) {
+            adp.playingIdx = remaining.findIndex(t => t.trackId === playingTrackId);
+        } else {
+            adp.playingIdx = -1;
+        }
         if (adp.playingIdx < 0) adp.playingIdx = -1;
     } else {
         adp.playingIdx = -1;
@@ -689,10 +706,10 @@ function getPlaylistView() {
         });
     }
 
-    // If playing but track was shifted (shouldn't happen with new design), show it
-    if (adp.isPlaying && adp.playingTrack && adp.playingIdx < 0) {
+    // Fix #19: Only show phantom entry if we have a valid msgId from tracks
+    if (adp.isPlaying && adp.playingTrack && adp.playingIdx < 0 && adp.tracks.length > 0) {
         view.unshift({
-            msgId: adp.tracks[0]?.msgId ?? '?',
+            msgId: adp.tracks[0]?.msgId ?? null,
             tracks: [{ text: adp.playingTrack, playing: true, pending: false, error: null }],
             isPlaying: true,
         });
@@ -718,8 +735,9 @@ async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '') {
     log(`[tts] voice: ${voiceId} (${charName}${isUser ? ' user' : ''})`);
 
     // Add placeholder immediately (sync) — ensures correct order
+    // Fix #4: Include unique trackId for reliable matching
     const trackIdx = adp.tracks.length;
-    const placeholder = { url: null, duration: 0, text, msgId, pending: true, error: null, isUser, charName };
+    const placeholder = { trackId: nextTrackId++, url: null, duration: 0, text, msgId, pending: true, error: null, isUser, charName };
     adp.tracks.push(placeholder);
     log(`add #${trackIdx} msg=${msgId} "${text.substring(0, 50)}"`);
     refreshPlaylistUi();
@@ -907,8 +925,9 @@ function processNewText(fullText, msgId) {
 
     // Append new text to global buffer
     const newText = fullText.substring(adp.lastTextLen);
-    adp.lastTextLen = fullText.length;
+    // Fix #10: Store prefix BEFORE updating lastTextLen to avoid storing full text every tick
     adp.lastSeenPrefix = fullText.substring(0, adp.lastTextLen);
+    adp.lastTextLen = fullText.length;
     adp.textBuffer += newText;
 
     // Split sentences and push to queue — server merges short ones
@@ -941,14 +960,14 @@ function onTick() {
     if (!lastMsg || lastMsg.is_system) return;
     // Skip user messages unless narrate_user is enabled
     if (lastMsg.is_user && !extension_settings.tts.narrate_user) {
-        log(`[tts] skip user msg: narrate_user=${extension_settings.tts.narrate_user}`);
+        logDebug(`[tts] skip user msg: narrate_user=${extension_settings.tts.narrate_user}`);
         return;
     }
     if (lastMsg.mes == null) return;
 
     adp.isUserMsg = !!lastMsg.is_user;
     adp.msgCharName = lastMsg.name || (lastMsg.is_user ? context.name1 : context.name2);
-    log(`[tts] tick: isUser=${adp.isUserMsg} name=${adp.msgCharName}`);
+    logDebug(`[tts] tick: isUser=${adp.isUserMsg} name=${adp.msgCharName}`);
     processNewText(lastMsg.mes, lastId);
 }
 
@@ -956,12 +975,7 @@ function onTick() {
 
 let audioWarmupDone = false;
 
-function warmupAudio() {
-    const url = URL.createObjectURL(new Blob([new Uint8Array(44)], { type: 'audio/wav' }));
-    const audio = new Audio(url);
-    audio.volume = 0.01;
-    audio.play().then(() => { audio.onended = () => URL.revokeObjectURL(url); }).catch(() => { URL.revokeObjectURL(url); });
-}
+// Fix #9: Removed redundant warmupAudio() — playNextInQueue() already handles warmup.
 
 // ─── ST Integration ────────────────────────────────────────────────
 
@@ -1036,7 +1050,6 @@ function onGenerationStarted(generationType, _args, isDryRun) {
     if (isDryRun) return;
 
     log(`gen start type=${generationType}`);
-    warmupAudio();
 
     if (generationType === 'regenerate') {
         nukePlaylist();
@@ -1118,7 +1131,6 @@ export function onActivate() {
         log(`narrate msg=${id}`);
         clearHighlight();
         nukePlaylist();
-        warmupAudio();
         adp.active = true;
         adp.isUserMsg = !!message.is_user;
         adp.msgCharName = message.name || (message.is_user ? context.name1 : context.name2);

@@ -8,6 +8,7 @@ let wsUrl = '';
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 let pendingSends = [];  // messages buffered while reconnecting
+let explicitlyClosed = false; // Fix #18: track if worker was explicitly closed
 
 function connect() {
     if (ws && ws.readyState <= 1) return;
@@ -46,7 +47,10 @@ function connect() {
         wsReady = false;
         ws = null;
         postMessage({ type: 'status', connected: false });
-        scheduleReconnect();
+        // Fix #18: Don't reconnect if explicitly closed
+        if (!explicitlyClosed) {
+            scheduleReconnect();
+        }
     };
 
     ws.onerror = () => {};
@@ -81,6 +85,7 @@ self.onmessage = (event) => {
             break;
 
         case 'close':
+            explicitlyClosed = true; // Fix #18: mark as explicitly closed
             if (reconnectTimer) clearTimeout(reconnectTimer);
             pendingSends = [];
             if (ws) try { ws.close(); } catch {}

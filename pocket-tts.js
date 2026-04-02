@@ -178,12 +178,13 @@ class PocketTtsProvider {
         $('#ptts_top_p').val(this.settings.top_p);
         $('#ptts_top_p_val').text(this.settings.top_p);
 
-        $('#ptts_endpoint').on('input', () => this.onSettingsChange());
-        $('#ptts_model').on('change', () => this.onSettingsChange());
-        $('#ptts_format').on('change', () => this.onSettingsChange());
-        $('#ptts_speed').on('input', () => this.onSettingsChange());
-        $('#ptts_temperature').on('input', () => this.onSettingsChange());
-        $('#ptts_top_p').on('input', () => this.onSettingsChange());
+        // Fix #17: Use namespaced events to prevent duplicate listeners on reinit
+        $('#ptts_endpoint').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
+        $('#ptts_model').off('change.ptts').on('change.ptts', () => this.onSettingsChange());
+        $('#ptts_format').off('change.ptts').on('change.ptts', () => this.onSettingsChange());
+        $('#ptts_speed').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
+        $('#ptts_temperature').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
+        $('#ptts_top_p').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
 
         window._pttsProvider = this;
         this._initWorker();
@@ -302,7 +303,7 @@ class PocketTtsProvider {
         blobPromise._resolve = _resolve;
         blobPromise._reject = _reject;
 
-        const pending = { id: reqId, promise: blobPromise, chunks: [], retryCount: 0, payload: null };
+        const pending = { id: reqId, promise: blobPromise, chunks: [], retryCount: 0, payload: null, retryScheduled: false };
         this._wsPending.push(pending);
 
         pending.timeout = setTimeout(() => {
@@ -366,19 +367,23 @@ class PocketTtsProvider {
     /**
      * Retry a failed request. Resets pending state and re-sends with backoff.
      * Returns true if retry was scheduled, false if max retries reached.
+     * Fix #3: Guard against duplicate retries by checking retryScheduled flag.
      */
     _retryRequest(pending, reason) {
+        if (pending.retryScheduled) return true; // already scheduled, don't duplicate
         if (pending.retryCount >= PocketTtsProvider.MAX_RETRIES) return false;
 
         const delay = PocketTtsProvider.RETRY_DELAYS[pending.retryCount] || 4000;
         pending.retryCount++;
         pending.chunks = [];
+        pending.retryScheduled = true;
 
         console.log('[pocketTTS-WS] retry %d/%d for %s in %dms (%s)',
             pending.retryCount, PocketTtsProvider.MAX_RETRIES,
             pending.id, delay, reason);
 
         setTimeout(() => {
+            pending.retryScheduled = false;
             // Re-add to pending if it was removed
             if (!this._wsPending.includes(pending)) {
                 this._wsPending.push(pending);
@@ -423,7 +428,17 @@ class PocketTtsProvider {
         }
 
         if (type === 'audio') {
-            // Accumulate raw chunks — they'll be associated with a request ID on 'done'
+            // Accumulate raw chunks — they'll be associated with a request ID on 'done'.
+            // WHY no request_id on binary frames: the WebSocket protocol sends raw audio bytes
+            // for efficiency; the server is single-threaded and sequential so chunks always
+            // belong to the oldest pending request.
+            // Fix #2: If no pending requests exist, these chunks are orphaned (late delivery
+            // from a cancelled/timed-out request that was already removed) — discard them.
+            if (this._wsPending.length === 0) {
+                console.log('[pocketTTS-WS] warning: audio chunk received with no pending request (orphaned), discarding');
+                this._audioChunks = []; // reset in case of partial accumulation
+                return;
+            }
             this._audioChunks.push(new Uint8Array(data));
             return;
         }
@@ -435,6 +450,16 @@ class PocketTtsProvider {
                     audio_duration: msg.audio_duration || 0,
                     gen_time: msg.gen_time || 0,
                 };
+
+                // Fix #1: Check if any done IDs were cancelled — discard chunks if so
+                const hasCancelled = doneIds.some(id => this._cancelledIds.has(id));
+                if (hasCancelled) {
+                    for (const id of doneIds) this._cancelledIds.delete(id);
+                    this._audioChunks = []; // discard stale audio
+                    console.log('[pocketTTS-WS] discarding chunks for cancelled request(s):', doneIds);
+                    this._updateStatus(this.ready);
+                    return;
+                }
 
                 // Claim the accumulated audio chunks for this request, then reset buffer
                 const chunks = this._audioChunks;
@@ -462,6 +487,7 @@ class PocketTtsProvider {
                         // Evict oldest entries if buffer grows too large
                         while (this._doneBuffer.size > PocketTtsProvider.MAX_DONE_BUFFER) {
                             const oldest = this._doneBuffer.keys().next().value;
+                            console.log('[pocketTTS-WS] warning: evicting buffered response for %s (buffer full)', oldest);
                             this._doneBuffer.delete(oldest);
                         }
                     }
