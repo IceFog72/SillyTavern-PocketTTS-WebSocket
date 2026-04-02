@@ -897,12 +897,14 @@ function processNewText(fullText, msgId) {
 
     // Detect text modification — ST may change text during streaming (parse reasoning, apply regex)
     // If previously seen text doesn't match current prefix, reset tracking
-    if (adp.lastTextLen > 0 && adp.lastSeenPrefix) {
-        const currentPrefix = fullText.substring(0, Math.min(adp.lastTextLen, fullText.length));
+    // Fix: Only reset on DELETIONS (text got shorter than what we've seen).
+    // Insertions/modifications that shift text should NOT reprocess old content.
+    if (adp.lastTextLen > 0 && adp.lastSeenPrefix && fullText.length >= adp.lastSeenPrefix.length) {
+        const currentPrefix = fullText.substring(0, adp.lastSeenPrefix.length);
         if (currentPrefix !== adp.lastSeenPrefix) {
-            // Text was modified — reprocess from the last known good position
-            log(`text modified at ${adp.lastTextLen}, resetting`);
-            // Find where our last seen prefix still matches
+            // Prefix changed — could be a modification during streaming.
+            // Only reset if we can find where the old prefix still matches,
+            // meaning text was deleted/shifted. Otherwise keep current position.
             let newOffset = 0;
             for (let i = Math.min(adp.lastSeenPrefix.length, fullText.length) - 1; i > 0; i--) {
                 if (fullText.startsWith(adp.lastSeenPrefix.substring(0, i))) {
@@ -910,24 +912,31 @@ function processNewText(fullText, msgId) {
                     break;
                 }
             }
-            adp.lastTextLen = newOffset;
-            const charsDeleted = adp.lastSeenPrefix.length - newOffset;
-            if (charsDeleted > 0 && adp.textBuffer.length > 0) {
-                // Deletion overlaps with buffer — trim buffer, but don't go below 0
-                const trim = Math.min(charsDeleted, adp.textBuffer.length);
-                adp.textBuffer = adp.textBuffer.substring(0, adp.textBuffer.length - trim);
-                if (charsDeleted > trim) {
-                    log(`text modified: ${charsDeleted - trim} chars lost (deletion exceeds buffer)`);
+            // Only reset if we found a valid match point (not the full current position)
+            if (newOffset < adp.lastTextLen) {
+                log(`text modified at ${adp.lastTextLen}, resetting to ${newOffset}`);
+                const charsDeleted = adp.lastTextLen - newOffset;
+                adp.lastTextLen = newOffset;
+                if (charsDeleted > 0 && adp.textBuffer.length > 0) {
+                    const trim = Math.min(charsDeleted, adp.textBuffer.length);
+                    adp.textBuffer = adp.textBuffer.substring(0, adp.textBuffer.length - trim);
+                    if (charsDeleted > trim) {
+                        log(`text modified: ${charsDeleted - trim} chars lost (deletion exceeds buffer)`);
+                    }
                 }
+            } else {
+                // No earlier match found — text was modified but not deleted.
+                // Skip ahead to avoid reprocessing. Update prefix to current state.
+                log(`text modified but keeping position at ${adp.lastTextLen}`);
+                adp.lastSeenPrefix = fullText.substring(0, Math.min(adp.lastTextLen, fullText.length));
             }
         }
     }
 
     // Append new text to global buffer
     const newText = fullText.substring(adp.lastTextLen);
-    // Fix #10: Store prefix BEFORE updating lastTextLen to avoid storing full text every tick
-    adp.lastSeenPrefix = fullText.substring(0, adp.lastTextLen);
     adp.lastTextLen = fullText.length;
+    adp.lastSeenPrefix = fullText;
     adp.textBuffer += newText;
 
     // Split sentences and push to queue — server merges short ones
@@ -941,9 +950,31 @@ function processNewText(fullText, msgId) {
 }
 
 function onSwipe() {
-    if (!adp.active) return;
+    // Fix: Don't gate on adp.active — swipe can happen after generation ends
+    // while old audio is still playing. We need to stop it regardless.
     log('swipe event');
-    nukeMsgTracks(adp.lastMsgId);
+
+    // Determine which message to nuke: currently playing or last generated
+    const playingMsgId = adp.isPlaying && adp.playingIdx >= 0
+        ? adp.tracks[adp.playingIdx]?.msgId
+        : null;
+    const targetMsgId = playingMsgId ?? adp.lastMsgId;
+
+    if (targetMsgId != null) {
+        nukeMsgTracks(targetMsgId);
+    } else {
+        // No known message — just stop any playing audio
+        if (adp.isPlaying) {
+            pttsAudio.pause();
+            pttsAudio.onended = null;
+            pttsAudio.onerror = null;
+            pttsAudio.removeAttribute('src');
+            adp.isPlaying = false;
+            adp.playingTrack = null;
+            clearHighlight();
+        }
+    }
+
     adp.lastMsgId = null;
     adp.lastTextLen = 0;
     adp.textBuffer = '';
