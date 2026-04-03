@@ -1,6 +1,7 @@
 # SillyTavern PocketTTS WebSocket
 
 TTS extension for [pocket-tts-openapi](https://github.com/IceFog72/pocket-tts-openapi).
+<img width="1857" height="1284" alt="image" src="https://github.com/user-attachments/assets/a6d10597-21bc-467d-86d0-98edcb9e1948" />
 
 ## Features
 
