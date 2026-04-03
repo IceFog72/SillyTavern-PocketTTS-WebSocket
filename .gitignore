@@ -2,3 +2,5 @@ ARCHITECTURE.md
 PLAN.md
 TESTING.md
 .agent-orchestrator/
+__tests__/
+tests/
