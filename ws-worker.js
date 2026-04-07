@@ -10,6 +10,8 @@ let reconnectAttempts = 0;
 let pendingSends = [];  // messages buffered while reconnecting
 let explicitlyClosed = false; // Fix #18: track if worker was explicitly closed
 
+const MAX_RECONNECT_ATTEMPTS = 10;
+
 function connect() {
     if (ws && ws.readyState <= 1) return;
 
@@ -58,6 +60,11 @@ function connect() {
 
 function scheduleReconnect() {
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.error(`[pocketTTS-WS] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Stopping.`);
+        postMessage({ type: 'status', connected: false, fatal: true });
+        return;
+    }
     const delay = Math.min(500 * Math.pow(1.5, reconnectAttempts), 5000);
     reconnectAttempts++;
     reconnectTimer = setTimeout(connect, delay);

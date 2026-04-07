@@ -101,11 +101,16 @@ class PocketTtsProvider {
 
     // ─── Status ─────────────────────────────────────────────────────
 
-    _updateStatus(connected) {
+    _updateStatus(connected, fatal = false) {
         const el = document.getElementById('ptts_status');
         if (!el) return;
         const pending = this._wsPending.length;
         const qInfo = pending > 0 ? ` (${pending} pending)` : '';
+
+        if (fatal) {
+            el.innerHTML = `<span style="color:#f44336;">&#9888; Connection failed permanently.</span><br><small>Max retries reached. Check server and manual reload ST.</small>`;
+            return;
+        }
 
         el.innerHTML = connected
             ? `<span style="color:#4caf50;">●</span> Connected${qInfo}`
@@ -154,10 +159,53 @@ class PocketTtsProvider {
 
         if (this.settings.provider_endpoint !== oldEndpoint) {
             this._closeWorker();
-            this._initWorker();
-            this.checkReady().then(() => this._updateStatus(this.ready));
+            this.checkReady().then(() => {
+                if (this.ready) {
+                    this._initWorker();
+                }
+                this._updateStatus(this.ready || this._workerReady);
+            });
         }
         saveTtsProviderSettings();
+    }
+
+    // ─── Worker Lifecycle ───────────────────────────────────────────
+
+    _initWorker() {
+        if (this._worker) return;
+
+        // Skip init if TTS is disabled globally to prevent unnecessary background connections
+        const es = window.extension_settings || window.SillyTavern?.extension_settings;
+        // Robust check: explicitly check for false, or treat null/undefined as disabled if that's the intention.
+        // Usually, in ST, if it's not enabled, we shouldn't be connecting.
+        if (es?.tts?.enabled === false) {
+            console.log('[pocketTTS-WS] worker init skipped: TTS disabled globally');
+            return;
+        }
+
+        const workerUrl = new URL('./ws-worker.js', import.meta.url);
+        this._worker = new Worker(workerUrl);
+        this._worker.onmessage = (e) => this._onWorkerMessage(e);
+        this._worker.postMessage({ type: 'init', url: this._getWsUrl() });
+    }
+
+    _closeWorker() {
+        if (this._worker) {
+            this._worker.postMessage({ type: 'close' });
+            this._worker.terminate();
+            this._worker = null;
+            this._workerReady = false;
+        }
+        // Reject all pending promises — worker is gone, no responses will come
+        for (const p of this._wsPending) {
+            clearTimeout(p.timeout);
+            p.promise._reject(new Error('Worker closed'));
+        }
+        this._wsPending = [];
+        this._audioChunks = [];
+        this._sendQueue = [];
+        this._doneBuffer.clear();
+        this._cancelledIds.clear();
     }
 
     async loadSettings(settings) {
@@ -187,10 +235,13 @@ class PocketTtsProvider {
         $('#ptts_top_p').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
 
         window._pttsProvider = this;
-        this._initWorker();
         await this._loadVoices();
         await this.checkReady();
-        this._updateStatus(this.ready);
+        // Only init worker if health check passes AND it's enabled
+        if (this.ready) {
+            this._initWorker();
+        }
+        this._updateStatus(this.ready || this._workerReady);
     }
 
     // ─── Readiness ──────────────────────────────────────────────────
@@ -215,7 +266,10 @@ class PocketTtsProvider {
     async onRefreshClick() {
         await this._loadVoices();
         await this.checkReady();
-        this._updateStatus(this.ready);
+        if (this.ready) {
+            this._initWorker();
+        }
+        this._updateStatus(this.ready || this._workerReady);
     }
 
     // ─── Voice Management ──────────────────────────────────────────
@@ -410,16 +464,16 @@ class PocketTtsProvider {
     // ─── Worker Message Handling ─────────────────────────────────────
 
     _onWorkerMessage(event) {
-        const { type, data, msg, error, connected, requestId } = event.data;
+        const { type, data, msg, error, connected, requestId, fatal } = event.data;
 
         if (type === 'status') {
             this._workerReady = connected;
-            this._updateStatus(this.ready);
+            this._updateStatus(connected, fatal);
             // On disconnect, reject all pending requests so the client doesn't hang
             if (!connected) {
                 for (const p of this._wsPending) {
                     clearTimeout(p.timeout);
-                    p.promise._reject(new Error('WebSocket disconnected'));
+                    p.promise._reject(new Error(fatal ? 'Connection failed (reconnect limit reached)' : 'WebSocket disconnected'));
                 }
                 this._wsPending = [];
                 this._audioChunks = [];
@@ -533,35 +587,6 @@ class PocketTtsProvider {
             // Other JSON — ignore
             return;
         }
-    }
-
-    // ─── Worker Lifecycle ───────────────────────────────────────────
-
-    _initWorker() {
-        if (this._worker) return;
-        const workerUrl = new URL('./ws-worker.js', import.meta.url);
-        this._worker = new Worker(workerUrl);
-        this._worker.onmessage = (e) => this._onWorkerMessage(e);
-        this._worker.postMessage({ type: 'init', url: this._getWsUrl() });
-    }
-
-    _closeWorker() {
-        if (this._worker) {
-            this._worker.postMessage({ type: 'close' });
-            this._worker.terminate();
-            this._worker = null;
-            this._workerReady = false;
-        }
-        // Reject all pending promises — worker is gone, no responses will come
-        for (const p of this._wsPending) {
-            clearTimeout(p.timeout);
-            p.promise._reject(new Error('Worker closed'));
-        }
-        this._wsPending = [];
-        this._audioChunks = [];
-        this._sendQueue = [];
-        this._doneBuffer.clear();
-        this._cancelledIds.clear();
     }
 
     _getWsUrl() {
