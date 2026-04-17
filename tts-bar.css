@@ -7,7 +7,7 @@
     background-color: var(--SmartThemeBlurTintColor);
     backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
     -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
-    padding: 6px 10px;
+    padding: 2px 10px;
     font-size: calc(var(--mainFontSize, 16px) * 0.85);
     color: var(--SmartThemeBodyColor);
     overflow: hidden;
