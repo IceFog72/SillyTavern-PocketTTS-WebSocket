@@ -34,10 +34,8 @@ class PocketTtsProvider {
     static RETRY_DELAYS = [1000, 2000, 4000];
 
     static MODEL_OPTIONS = [
-        { value: 'tts-1', label: 'tts-1 (Fast CPU)' },
-        { value: 'tts-1-hd', label: 'tts-1-hd (Quality CPU)' },
-        { value: 'tts-1-cuda', label: 'tts-1-cuda (Fast GPU)' },
-        { value: 'tts-1-hd-cuda', label: 'tts-1-hd-cuda (Quality GPU)' },
+        { value: 'english-cpu', label: 'english-cpu' },
+        { value: 'english-gpu', label: 'english-gpu' },
     ];
 
     defaultSettings = {
@@ -47,7 +45,7 @@ class PocketTtsProvider {
         speed: 1.0,
         temperature: 1.0,
         top_p: 1.0,
-        model: 'tts-1',
+        model: 'english-cpu',
         voiceMap: {},
     };
 
@@ -236,6 +234,7 @@ class PocketTtsProvider {
 
         window._pttsProvider = this;
         await this._loadVoices();
+        await this._loadModels();
         await this.checkReady();
         // Only init worker if health check passes AND it's enabled
         if (this.ready) {
@@ -265,6 +264,7 @@ class PocketTtsProvider {
 
     async onRefreshClick() {
         await this._loadVoices();
+        await this._loadModels();
         await this.checkReady();
         if (this.ready) {
             this._initWorker();
@@ -292,6 +292,26 @@ class PocketTtsProvider {
             'alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma',
         ].map(v => ({ name: v, voice_id: v, lang: 'en' }));
         return this.voices;
+    }
+
+    async _loadModels() {
+        try {
+            const url = this.settings.provider_endpoint.replace(/\/$/, '');
+            const resp = await fetch(url + '/v1/models', { signal: AbortSignal.timeout(3000) });
+            if (resp.ok) {
+                const data = await resp.json();
+                const modelSelect = document.getElementById('ptts_model');
+                if (modelSelect && data.data && Array.isArray(data.data)) {
+                    const currentVal = this.settings.model || this.defaultSettings.model;
+                    modelSelect.innerHTML = data.data.map(m => {
+                        const isSelected = currentVal === m.id ? ' selected' : '';
+                        return `<option value="${m.id}"${isSelected}>${m.id}</option>`;
+                    }).join('');
+                    // Sync the settings value just in case the currentVal isn't in the new list
+                    this.settings.model = String($('#ptts_model').val());
+                }
+            }
+        } catch { /* server unavailable or endpoint not supported */ }
     }
 
     async getVoice(voiceName) {
