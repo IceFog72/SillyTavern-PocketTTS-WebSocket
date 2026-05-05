@@ -37,13 +37,20 @@ Text highlighting uses substring search against rendered DOM with Unicode normal
 | Setting | Default | Description |
 |---------|---------|-------------|
 | Server Endpoint | `http://localhost:8005` | Server URL |
-| Model | `tts-1` | `tts-1`, `tts-1-hd`, `tts-1-cuda`, `tts-1-hd-cuda` |
+| Model | `english-cpu` | Dynamically populated from server (e.g., `english-cpu`, `french_24l-gpu`) |
 | Audio Format | `mp3` | mp3, wav, opus, flac, aac |
 | Speed | `1.0` | 0.5–2.0 |
 | Temperature | `1.0` | 0.0–2.0 |
 | Top P | `1.0` | 0.0–1.0 |
 
-Voice mapping: SillyTavern's TTS Voice Map section.s
+Voice mapping: SillyTavern's TTS Voice Map section.
+
+### GPU VRAM Overhead (CUDA Context)
+When using a `-gpu` model variant, you may notice a lingering ~170 MB of VRAM usage even after TTS generation finishes and you switch back to a `-cpu` model. **This is not a memory leak.**
+
+Whenever a PyTorch application initializes the GPU for the first time, the NVIDIA driver creates a "CUDA context" for that Python process. This context loads essential GPU libraries (like cuBLAS/cuDNN handles) and driver state into VRAM. Depending on your driver version and GPU architecture, this base footprint is typically between 150 MB and 300 MB.
+
+This overhead is a hard architectural limitation of PyTorch and CUDA. Once a Python process creates a CUDA context, that memory is locked to the process until the backend server itself is shut down. However, the heavy components (the 1GB+ TTS model weights) are successfully freed when switching to a `-cpu` model in the extension UI, leaving the vast majority of your VRAM completely free for your LLMs and other tasks.
 
 ## Feedback
 
