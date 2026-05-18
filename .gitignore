@@ -4,3 +4,4 @@ TESTING.md
 .agent-orchestrator/
 __tests__/
 tests/
+node_modules/

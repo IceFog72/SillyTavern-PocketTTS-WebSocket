@@ -1,34 +1,48 @@
 // pocket-tts.js — SillyTavern TTS Provider for pocket-tts-openapi
 // Web Worker for WS connection (survives main thread blocking by LLM streaming).
 
-import { saveTtsProviderSettings, getPreviewString } from '../../tts/index.js';
+// SillyTavern runtime modules live outside this extension package and do not ship local .d.ts files.
+// @ts-ignore
+import { saveTtsProviderSettings, getPreviewString } from '../../../tts/index.js';
+import type {
+    AudioFormat,
+    DoneBufferEntry,
+    PendingRequest,
+    PocketTtsSettings,
+    TimingInfo,
+    VoiceInfo,
+    WsClientPayload,
+    WsTextAppendPayload,
+} from './types.js';
 
 export { PocketTtsProvider };
 
 class PocketTtsProvider {
-    settings = {};
+    settings: PocketTtsSettings = {} as PocketTtsSettings;
     ready = false;
-    voices = [];
+    voices: VoiceInfo[] = [];
     separator = '. ';
     static EXPECTED_SERVER_VERSION = '2.0.0';
 
     audioElement = document.createElement('audio');
 
-    _worker = null;
+    _worker: Worker | null = null;
     _workerReady = false;
     // Main thread: tracks promises by request_id — resolved when audio arrives
-    _wsPending = [];
+    _wsPending: PendingRequest[] = [];
     // Buffer for responses that arrive before their promises are created
-    _doneBuffer = new Map();  // request_id → {chunks, timing}
+    _doneBuffer = new Map<string, DoneBufferEntry>();  // request_id → {chunks, timing}
     static MAX_DONE_BUFFER = 10; // limit to prevent memory leak
     // Raw audio chunk buffer — accumulated between requests, claimed on 'done'
-    _audioChunks = [];
+    _audioChunks: Uint8Array[] = [];
     // Track cancelled/timed-out request IDs to discard late chunks
-    _cancelledIds = new Set();
+    _cancelledIds = new Set<string>();
     // Send queue: ensures text goes to server in order (sequential IDs)
     // Sends fire-and-forget — doesn't wait for response
-    _sendQueue = [];
+    _sendQueue: WsClientPayload[] = [];
     _nextReqId = 0;
+    lastTiming: TimingInfo = { audio_duration: 0, gen_time: 0 };
+    _previewUrl: string | null = null;
 
     static MAX_RETRIES = 3;
     static RETRY_DELAYS = [1000, 2000, 4000];
@@ -41,7 +55,7 @@ class PocketTtsProvider {
     defaultSettings = {
         provider_endpoint: 'http://localhost:8005',
         voice: 'nova',
-        format: 'mp3',
+        format: 'mp3' as AudioFormat,
         speed: 1.0,
         temperature: 1.0,
         top_p: 1.0,
@@ -146,7 +160,7 @@ class PocketTtsProvider {
 
         this.settings.provider_endpoint = String($('#ptts_endpoint').val());
         this.settings.model = String($('#ptts_model').val());
-        this.settings.format = String($('#ptts_format').val());
+        this.settings.format = normalizeAudioFormat(String($('#ptts_format').val()));
         this.settings.speed = parseFloat($('#ptts_speed').val());
         this.settings.temperature = parseFloat($('#ptts_temperature').val());
         this.settings.top_p = parseFloat($('#ptts_top_p').val());
@@ -170,19 +184,18 @@ class PocketTtsProvider {
     // ─── Worker Lifecycle ───────────────────────────────────────────
 
     _initWorker() {
-        if (this._worker) return;
-
-        // Skip init if TTS is disabled globally to prevent unnecessary background connections
-        const es = window.extension_settings || window.SillyTavern?.extension_settings;
-        // Robust check: explicitly check for false, or treat null/undefined as disabled if that's the intention.
-        // Usually, in ST, if it's not enabled, we shouldn't be connecting.
-        if (es?.tts?.enabled === false) {
-            console.log('[pocketTTS-WS] worker init skipped: TTS disabled globally');
+        if (this._worker) {
+            console.log('[pocketTTS-WS] provider: worker already initialized');
             return;
         }
 
         const workerUrl = new URL('./ws-worker.js', import.meta.url);
-        this._worker = new Worker(workerUrl);
+        console.log('[pocketTTS-WS] provider: init worker', {
+            workerUrl: workerUrl.toString(),
+            wsUrl: this._getWsUrl(),
+            ready: this.ready,
+        });
+        this._worker = new Worker(workerUrl, { type: 'module' });
         this._worker.onmessage = (e) => this._onWorkerMessage(e);
         this._worker.postMessage({ type: 'init', url: this._getWsUrl() });
     }
@@ -204,6 +217,20 @@ class PocketTtsProvider {
         this._sendQueue = [];
         this._doneBuffer.clear();
         this._cancelledIds.clear();
+    }
+
+    resetSession(reason = 'reset') {
+        console.log('[pocketTTS-WS] provider: reset session', {
+            reason,
+            pending: this._wsPending.length,
+            sendQueue: this._sendQueue.length,
+            worker: !!this._worker,
+            workerReady: this._workerReady,
+        });
+        this._closeWorker();
+        if (this.ready) {
+            this._initWorker();
+        }
     }
 
     async loadSettings(settings) {
@@ -354,6 +381,14 @@ class PocketTtsProvider {
         if (!trimmed) return;
 
         const reqId = 'r' + (this._nextReqId++);
+        console.log('[pocketTTS-WS] provider: generateTts', {
+            reqId,
+            voiceId,
+            chars: trimmed.length,
+            ready: this.ready,
+            worker: !!this._worker,
+            workerReady: this._workerReady,
+        });
 
         // Check if response already arrived (server processed before promise created)
         // This happens when the server is fast and the client is slow (blocked by LLM)
@@ -366,34 +401,35 @@ class PocketTtsProvider {
                 yield Promise.resolve(null);
                 return;
             }
-            const blob = new Blob(buffered.chunks, { type: this._getMimeType() });
+            const blob = new Blob(buffered.chunks as BlobPart[], { type: this._getMimeType() });
             yield Promise.resolve(blob);
             return;
         }
 
         // Create promise — resolved when audio arrives with matching request_id
-        let _resolve, _reject;
-        const blobPromise = new Promise((res, rej) => { _resolve = res; _reject = rej; });
+        let _resolve: (value: Blob | null) => void;
+        let _reject: (reason?: unknown) => void;
+        const blobPromise = new Promise<Blob | null>((res, rej) => { _resolve = res; _reject = rej; }) as PendingRequest['promise'];
         blobPromise._resolve = _resolve;
         blobPromise._reject = _reject;
 
-        const pending = { id: reqId, promise: blobPromise, chunks: [], retryCount: 0, payload: null, retryScheduled: false };
+        const pending: PendingRequest = { id: reqId, promise: blobPromise, chunks: [], retryCount: 0, payload: null, retryScheduled: false };
         this._wsPending.push(pending);
 
         pending.timeout = setTimeout(() => {
             const idx = this._wsPending.indexOf(pending);
             if (idx >= 0) {
-                this._cancelledIds.add(pending.id);
                 if (this._retryRequest(pending, 'timeout')) {
                     return; // retry scheduled
                 }
+                this._cancelledIds.add(pending.id);
                 this._wsPending.splice(idx, 1);
             }
             blobPromise._reject(new Error('TTS timeout (60s)'));
         }, 60000);
 
         // Push to send queue — maintains text order
-        const payload = {
+        const payload: WsTextAppendPayload = {
             type: 'text.append',
             request_id: reqId,
             text: trimmed,
@@ -406,6 +442,11 @@ class PocketTtsProvider {
         };
         pending.payload = payload;
         this._sendQueue.push(payload);
+        console.log('[pocketTTS-WS] provider: queued payload', {
+            reqId,
+            sendQueue: this._sendQueue.length,
+            pending: this._wsPending.length,
+        });
 
         // Flush immediately — promise is already in _wsPending, so responses
         // can be matched. This ensures the server doesn't process the request
@@ -421,9 +462,24 @@ class PocketTtsProvider {
      * Called after each generateTts push and after each done/error received.
      */
     _flushSendQueue() {
-        if (!this._worker) return;
+        if (!this._worker && this.ready) {
+            console.log('[pocketTTS-WS] provider: no worker during flush, initializing');
+            this._initWorker();
+        }
+        if (!this._worker) {
+            console.warn('[pocketTTS-WS] provider: cannot flush, worker missing', {
+                ready: this.ready,
+                sendQueue: this._sendQueue.length,
+            });
+            return;
+        }
+        console.log('[pocketTTS-WS] provider: flushing send queue', { count: this._sendQueue.length });
         while (this._sendQueue.length > 0) {
             const payload = this._sendQueue.shift();
+            console.log('[pocketTTS-WS] provider: post worker payload', {
+                type: payload?.type,
+                requestId: payload && 'request_id' in payload ? payload.request_id : null,
+            });
             this._worker.postMessage({ type: 'send', payload });
         }
     }
@@ -434,7 +490,11 @@ class PocketTtsProvider {
      */
     sendTextDone() {
         if (this._worker) {
+            console.log('[pocketTTS-WS] provider: send text.done');
+            this._flushSendQueue();
             this._worker.postMessage({ type: 'send', payload: { type: 'text.done' } });
+        } else {
+            console.warn('[pocketTTS-WS] provider: text.done skipped, worker missing');
         }
     }
 
@@ -467,6 +527,7 @@ class PocketTtsProvider {
             pending.timeout = setTimeout(() => {
                 const idx = this._wsPending.indexOf(pending);
                 if (this._retryRequest(pending, 'timeout')) return;
+                this._cancelledIds.add(pending.id);
                 if (idx >= 0) this._wsPending.splice(idx, 1);
                 pending.promise._reject(new Error('TTS timeout (60s)'));
             }, 60000);
@@ -486,7 +547,13 @@ class PocketTtsProvider {
     _onWorkerMessage(event) {
         const { type, data, msg, error, connected, requestId, fatal } = event.data;
 
+        if (type === 'debug') {
+            console.log('[pocketTTS-WS] worker:', event.data.message, event.data);
+            return;
+        }
+
         if (type === 'status') {
+            console.log('[pocketTTS-WS] provider: worker status', { connected, fatal });
             this._workerReady = connected;
             this._updateStatus(connected, fatal);
             // On disconnect, reject all pending requests so the client doesn't hang
@@ -525,30 +592,34 @@ class PocketTtsProvider {
                     gen_time: msg.gen_time || 0,
                 };
 
-                // Fix #1: Check if any done IDs were cancelled — discard chunks if so
-                const hasCancelled = doneIds.some(id => this._cancelledIds.has(id));
-                if (hasCancelled) {
-                    for (const id of doneIds) this._cancelledIds.delete(id);
-                    this._audioChunks = []; // discard stale audio
-                    console.log('[pocketTTS-WS] discarding chunks for cancelled request(s):', doneIds);
-                    this._updateStatus(this.ready);
-                    return;
-                }
-
                 // Claim the accumulated audio chunks for this request, then reset buffer
                 const chunks = this._audioChunks;
                 this._audioChunks = [];
+                const firstIdCancelled = this._cancelledIds.has(doneIds[0]);
+                if (firstIdCancelled) {
+                    console.log('[pocketTTS-WS] discarding chunks for cancelled request:', doneIds[0]);
+                }
 
                 for (let di = 0; di < doneIds.length; di++) {
                     const rid = doneIds[di];
+                    if (this._cancelledIds.delete(rid)) {
+                        const cancelledIdx = this._wsPending.findIndex(p => p.id === rid);
+                        if (cancelledIdx >= 0) {
+                            const p = this._wsPending.splice(cancelledIdx, 1)[0];
+                            clearTimeout(p.timeout);
+                            p.promise._reject(new Error('TTS request cancelled'));
+                        }
+                        continue;
+                    }
+
                     const idx = this._wsPending.findIndex(p => p.id === rid);
                     if (idx >= 0) {
                         const p = this._wsPending.splice(idx, 1)[0];
                         clearTimeout(p.timeout);
                         this.lastTiming = timing;
                         // First ID in merge group gets the blob; rest get null (merged away)
-                        if (di === 0) {
-                            const blob = new Blob(chunks, { type: this._getMimeType() });
+                        if (di === 0 && !firstIdCancelled) {
+                            const blob = new Blob(chunks as BlobPart[], { type: this._getMimeType() });
                             p.promise._resolve(blob);
                         } else {
                             console.log('[pocketTTS-WS] merged: %s absorbed into %s', rid, doneIds[0]);
@@ -557,7 +628,7 @@ class PocketTtsProvider {
                     } else {
                         // Promise not created yet — buffer the response
                         console.log('[pocketTTS-WS] buffered early response for %s (%d chunks)', rid, chunks.length);
-                        this._doneBuffer.set(rid, { chunks: di === 0 ? chunks : [], timing, merged: di > 0 });
+                        this._doneBuffer.set(rid, { chunks: di === 0 && !firstIdCancelled ? chunks : [], timing, merged: di > 0 || firstIdCancelled });
                         // Evict oldest entries if buffer grows too large
                         while (this._doneBuffer.size > PocketTtsProvider.MAX_DONE_BUFFER) {
                             const oldest = this._doneBuffer.keys().next().value;
@@ -678,4 +749,10 @@ class PocketTtsProvider {
         }
         this._closeWorker();
     }
+}
+
+function normalizeAudioFormat(value: string): AudioFormat {
+    return ['mp3', 'wav', 'opus', 'flac', 'aac'].includes(value)
+        ? value as AudioFormat
+        : 'mp3';
 }

@@ -18,6 +18,17 @@ TTS extension for [pocket-tts-openapi](https://github.com/IceFog72/pocket-tts-op
 - [pocket-tts-openapi](https://github.com/IceFog72/pocket-tts-openapi) server (default `localhost:8005`)
 - SillyTavern
 
+## Development
+
+The extension is written in TypeScript under `src/` and compiled to browser ES modules under `dist/`.
+SillyTavern loads `dist/index.js` from `manifest.json`; the root `index.js` is only a compatibility re-export.
+
+```bash
+npm install
+npm run check
+npm run build
+```
+
 ## Architecture
 
 ### Text Processing
