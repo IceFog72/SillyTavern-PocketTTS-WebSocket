@@ -1,4 +1,4 @@
-import type { AudioFormat, DoneBufferEntry, PendingRequest, PocketTtsSettings, TimingInfo, VoiceInfo, WsClientPayload } from './types.js';
+import type { AudioFormat, ActiveAudioStream, DoneBufferEntry, PcmAudioStream, PendingRequest, PocketTtsSettings, TimingInfo, VoiceInfo, WsClientPayload } from './types.js';
 export { PocketTtsProvider };
 declare class PocketTtsProvider {
     settings: PocketTtsSettings;
@@ -18,6 +18,7 @@ declare class PocketTtsProvider {
     _nextReqId: number;
     lastTiming: TimingInfo;
     _previewUrl: string | null;
+    _pcmContext: AudioContext | null;
     static MAX_RETRIES: number;
     static RETRY_DELAYS: number[];
     static MODEL_OPTIONS: {
@@ -28,6 +29,7 @@ declare class PocketTtsProvider {
         provider_endpoint: string;
         voice: string;
         format: AudioFormat;
+        streamingFormat: "auto";
         speed: number;
         temperature: number;
         top_p: number;
@@ -48,6 +50,12 @@ declare class PocketTtsProvider {
     _loadModels(): Promise<void>;
     getVoice(voiceName: any): Promise<VoiceInfo>;
     fetchTtsVoiceObjects(): Promise<VoiceInfo[]>;
+    _refreshStreamingFormatOptions(autoSelect?: boolean): Promise<{
+        format: AudioFormat;
+        mime: string;
+        label: string;
+    }[]>;
+    _updateStreamingInfo(message?: string): void;
     processText(text: any): Promise<any>;
     /**
      * Generate TTS audio. Yields one Promise<Blob> per text part.
@@ -63,6 +71,25 @@ declare class PocketTtsProvider {
      * regardless of which message it came from.
      */
     generateTts(text: any, voiceId: any): AsyncGenerator<any, void, unknown>;
+    _canStreamCurrentFormat(): boolean;
+    _getStreamFormat(): AudioFormat;
+    _getStreamMimeType(): string;
+    _getStreamCandidate(): {
+        format: AudioFormat;
+        mime: string;
+        label: string;
+    } | null;
+    _detectStreamingCandidates(): Array<{
+        format: AudioFormat;
+        mime: string;
+        label: string;
+    }>;
+    _unlockPcm: () => void;
+    _createPcmStream(sampleRate?: number, channels?: number): PcmAudioStream;
+    _appendPcmChunk(stream: PcmAudioStream, bytes: Uint8Array): void;
+    _startPcmStream(stream: PcmAudioStream): void;
+    _finishPcmStream(stream: PcmAudioStream): void;
+    _stopPcmStream(stream: PcmAudioStream): void;
     /**
      * Send queued requests to worker in order.
      * Fire-and-forget: sends all queued items, doesn't wait for responses.
@@ -74,6 +101,9 @@ declare class PocketTtsProvider {
      * Server flushes merge queue and sends session_ended when complete.
      */
     sendTextDone(): void;
+    _createStream(mimeType?: string): ActiveAudioStream | null;
+    _appendStreamChunk(stream: ActiveAudioStream, data: Uint8Array): void;
+    _finishStream(stream: ActiveAudioStream): void;
     /**
      * Retry a failed request. Resets pending state and re-sends with backoff.
      * Returns true if retry was scheduled, false if max retries reached.
@@ -82,8 +112,9 @@ declare class PocketTtsProvider {
     _retryRequest(pending: any, reason: any): boolean;
     _onWorkerMessage(event: any): void;
     _getWsUrl(): string;
-    _getMimeType(): "audio/wav" | "audio/opus" | "audio/flac" | "audio/aac" | "audio/mpeg";
+    _getMimeType(): "audio/wav" | "audio/opus" | "audio/webm" | "audio/flac" | "audio/aac" | "audio/mpeg";
     _previewAbort: boolean;
+    _previewStream: PcmAudioStream | null;
     previewTtsVoice(voiceId: any): Promise<void>;
     dispose(): void;
 }

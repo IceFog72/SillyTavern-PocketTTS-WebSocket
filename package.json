@@ -7,9 +7,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "watch": "tsc -p tsconfig.json --watch",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test tests",
+    "test:browser": "node tests/browser-playback.cjs"
   },
   "devDependencies": {
+    "playwright": "^1.64.0",
     "typescript": "^5.9.3"
   }
 }

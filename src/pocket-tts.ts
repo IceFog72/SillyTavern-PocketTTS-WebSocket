@@ -1,3 +1,4 @@
+import { createPcmStream, appendPcm, pumpPcm, stopPcm } from "./pcm-playback.js";
 // pocket-tts.js — SillyTavern TTS Provider for pocket-tts-openapi
 // Web Worker for WS connection (survives main thread blocking by LLM streaming).
 
@@ -6,9 +7,12 @@
 import { saveTtsProviderSettings, getPreviewString } from '../../../tts/index.js';
 import type {
     AudioFormat,
+    ActiveAudioStream,
     DoneBufferEntry,
+    PcmAudioStream,
     PendingRequest,
     PocketTtsSettings,
+    StreamedAudio,
     TimingInfo,
     VoiceInfo,
     WsClientPayload,
@@ -43,6 +47,7 @@ class PocketTtsProvider {
     _nextReqId = 0;
     lastTiming: TimingInfo = { audio_duration: 0, gen_time: 0 };
     _previewUrl: string | null = null;
+    _pcmContext: AudioContext | null = null;
 
     static MAX_RETRIES = 3;
     static RETRY_DELAYS = [1000, 2000, 4000];
@@ -56,8 +61,9 @@ class PocketTtsProvider {
         provider_endpoint: 'http://localhost:8005',
         voice: 'nova',
         format: 'mp3' as AudioFormat,
+        streamingFormat: 'auto' as const,
         speed: 1.0,
-        temperature: 1.0,
+        temperature: 0.3,
         top_p: 1.0,
         model: 'english-cpu',
         voiceMap: {},
@@ -87,14 +93,21 @@ class PocketTtsProvider {
                 ${modelOptions}
             </select>
 
-            <label for="ptts_format">Audio Format:</label>
+            <label for="ptts_format">Buffered playback format:</label>
             <select id="ptts_format" class="text_pole">
                 <option value="mp3">MP3</option>
                 <option value="wav">WAV</option>
                 <option value="opus">Opus</option>
+                <option value="webm">WebM / Opus</option>
                 <option value="flac">FLAC</option>
                 <option value="aac">AAC</option>
             </select>
+            <label for="ptts_streaming_format">Streaming:</label>
+            <select id="ptts_streaming_format" class="text_pole">
+                <option value="off">Off — buffered playback</option>
+                <option value="auto">Auto — adaptive streaming</option>
+            </select>
+            <div id="ptts_streaming_info" style="margin:4px 0;font-size:0.85em;color:#aaa;"></div>
 
             <label for="ptts_speed">Speed: <span id="ptts_speed_val">${this.defaultSettings.speed}</span></label>
             <input id="ptts_speed" type="range" min="0.5" max="2.0" step="0.1"
@@ -161,6 +174,7 @@ class PocketTtsProvider {
         this.settings.provider_endpoint = String($('#ptts_endpoint').val());
         this.settings.model = String($('#ptts_model').val());
         this.settings.format = normalizeAudioFormat(String($('#ptts_format').val()));
+        this.settings.streamingFormat = normalizeStreamingFormat(String($('#ptts_streaming_format').val()));
         this.settings.speed = parseFloat($('#ptts_speed').val());
         this.settings.temperature = parseFloat($('#ptts_temperature').val());
         this.settings.top_p = parseFloat($('#ptts_top_p').val());
@@ -168,6 +182,7 @@ class PocketTtsProvider {
         $('#ptts_speed_val').text(this.settings.speed);
         $('#ptts_temperature_val').text(this.settings.temperature);
         $('#ptts_top_p_val').text(this.settings.top_p);
+        this._updateStreamingInfo();
 
         if (this.settings.provider_endpoint !== oldEndpoint) {
             this._closeWorker();
@@ -197,7 +212,7 @@ class PocketTtsProvider {
         });
         this._worker = new Worker(workerUrl, { type: 'module' });
         this._worker.onmessage = (e) => this._onWorkerMessage(e);
-        this._worker.postMessage({ type: 'init', url: this._getWsUrl() });
+        this._worker.postMessage({ type: 'init', url: this._getWsUrl(), reconnect: true });
     }
 
     _closeWorker() {
@@ -210,7 +225,9 @@ class PocketTtsProvider {
         // Reject all pending promises — worker is gone, no responses will come
         for (const p of this._wsPending) {
             clearTimeout(p.timeout);
+            if (p.pcmStream) this._finishPcmStream(p.pcmStream);
             p.promise._reject(new Error('Worker closed'));
+            p.done?._reject(new Error('Worker closed'));
         }
         this._wsPending = [];
         this._audioChunks = [];
@@ -234,6 +251,8 @@ class PocketTtsProvider {
     }
 
     async loadSettings(settings) {
+        document.addEventListener("pointerdown", this._unlockPcm, { passive: true });
+        document.addEventListener("keydown", this._unlockPcm, { passive: true });
         this.settings = { ...this.defaultSettings };
         for (const key in settings) {
             if (key in this.settings) {
@@ -244,6 +263,8 @@ class PocketTtsProvider {
         $('#ptts_endpoint').val(this.settings.provider_endpoint);
         $('#ptts_model').val(this.settings.model);
         $('#ptts_format').val(this.settings.format);
+        await this._refreshStreamingFormatOptions(false);
+        $('#ptts_streaming_format').val(this.settings.streamingFormat);
         $('#ptts_speed').val(this.settings.speed);
         $('#ptts_speed_val').text(this.settings.speed);
         $('#ptts_temperature').val(this.settings.temperature);
@@ -255,6 +276,7 @@ class PocketTtsProvider {
         $('#ptts_endpoint').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
         $('#ptts_model').off('change.ptts').on('change.ptts', () => this.onSettingsChange());
         $('#ptts_format').off('change.ptts').on('change.ptts', () => this.onSettingsChange());
+        $('#ptts_streaming_format').off('change.ptts').on('change.ptts', () => this.onSettingsChange());
         $('#ptts_speed').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
         $('#ptts_temperature').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
         $('#ptts_top_p').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
@@ -355,6 +377,54 @@ class PocketTtsProvider {
         return this.voices;
     }
 
+    async _refreshStreamingFormatOptions(autoSelect = true) {
+        const candidates = this._detectStreamingCandidates();
+        this.settings.streamingFormat = normalizeStreamingFormat(this.settings.streamingFormat || 'off');
+        const select = document.getElementById('ptts_streaming_format') as HTMLSelectElement | null;
+        if (!select) return candidates;
+
+        const current = normalizeStreamingFormat(this.settings.streamingFormat || select.value || 'off');
+        const options = [
+            '<option value="off">Off — buffered playback</option>',
+            candidates.length > 0 ? '<option value="auto">Auto — adaptive streaming</option>' : '',
+        ].filter(Boolean);
+        select.innerHTML = options.join('');
+
+        const valid = current === 'off'
+            || (current === 'auto' && candidates.length > 0);
+        const next = valid ? current : 'off';
+        select.value = next;
+        this.settings.streamingFormat = next;
+        if (autoSelect && current !== next) {
+            saveTtsProviderSettings();
+        }
+        this._updateStreamingInfo();
+        return candidates;
+    }
+
+    _updateStreamingInfo(message?: string) {
+        const el = document.getElementById('ptts_streaming_info');
+        if (!el) return;
+        if (message) {
+            el.textContent = message;
+            el.style.color = '#d9a441';
+            return;
+        }
+        const selected = normalizeStreamingFormat(this.settings.streamingFormat || 'off');
+        const candidate = this._getStreamCandidate();
+        const buffered = `Buffered tracks use ${this.settings.format.toUpperCase()}.`;
+        if (selected === 'off') {
+            el.textContent = `Live streaming is off. ${buffered}`;
+            el.style.color = '#aaa';
+        } else if (candidate) {
+            el.textContent = `Streaming uses ${candidate.label}. ${buffered} Used only if streaming falls back or is turned off.`;
+            el.style.color = '#aaa';
+        } else {
+            el.textContent = `Selected streaming mode is not supported by this browser. Falling back to buffered ${this.settings.format.toUpperCase()}.`;
+            el.style.color = '#d9a441';
+        }
+    }
+
     // ─── Text Processing ────────────────────────────────────────────
 
     async processText(text) {
@@ -407,13 +477,20 @@ class PocketTtsProvider {
         }
 
         // Create promise — resolved when audio arrives with matching request_id
-        let _resolve: (value: Blob | null) => void;
+        let _resolve: (value: Blob | StreamedAudio | null) => void;
         let _reject: (reason?: unknown) => void;
-        const blobPromise = new Promise<Blob | null>((res, rej) => { _resolve = res; _reject = rej; }) as PendingRequest['promise'];
+        const blobPromise = new Promise<Blob | StreamedAudio | null>((res, rej) => { _resolve = res; _reject = rej; }) as PendingRequest['promise'];
         blobPromise._resolve = _resolve;
         blobPromise._reject = _reject;
 
-        const pending: PendingRequest = { id: reqId, promise: blobPromise, chunks: [], retryCount: 0, payload: null, retryScheduled: false };
+        let doneResolve: () => void;
+        let doneReject: (reason?: unknown) => void;
+        const done = new Promise<void>((res, rej) => { doneResolve = res; doneReject = rej; }) as PendingRequest['done'];
+        done._resolve = doneResolve!;
+        done._reject = doneReject!;
+        void done.catch(() => {});
+
+        const pending: PendingRequest = { id: reqId, promise: blobPromise, done, chunks: [], retryCount: 0, payload: null, retryScheduled: false };
         this._wsPending.push(pending);
 
         pending.timeout = setTimeout(() => {
@@ -429,16 +506,25 @@ class PocketTtsProvider {
         }, 60000);
 
         // Push to send queue — maintains text order
+        const streamCandidate = this._getStreamCandidate();
+        const stream = streamCandidate !== null;
+        const wireFormat = streamCandidate?.format || this.settings.format;
+        if (!stream && this.settings.streamingFormat !== 'off') {
+            const message = `Live streaming ${this.settings.streamingFormat} is unavailable; falling back to buffered ${this.settings.format.toUpperCase()}.`;
+            console.warn('[pocketTTS-WS] provider:', message);
+            this._updateStreamingInfo(message);
+        }
         const payload: WsTextAppendPayload = {
             type: 'text.append',
             request_id: reqId,
             text: trimmed,
             voice: voiceId,
-            format: this.settings.format,
+            format: wireFormat,
             speed: this.settings.speed,
             temperature: this.settings.temperature,
             top_p: this.settings.top_p,
             model: this.settings.model,
+            stream,
         };
         pending.payload = payload;
         this._sendQueue.push(payload);
@@ -446,6 +532,9 @@ class PocketTtsProvider {
             reqId,
             sendQueue: this._sendQueue.length,
             pending: this._wsPending.length,
+            mode: stream ? 'streaming' : 'buffered',
+            format: wireFormat,
+            mimeType: stream ? streamCandidate?.mime : this._getMimeType(),
         });
 
         // Flush immediately — promise is already in _wsPending, so responses
@@ -455,6 +544,62 @@ class PocketTtsProvider {
 
         yield blobPromise;
     }
+
+    _canStreamCurrentFormat() {
+        return this._getStreamCandidate() !== null;
+    }
+
+    _getStreamFormat(): AudioFormat {
+        return this._getStreamCandidate()?.format || 'mp3';
+    }
+
+    _getStreamMimeType() {
+        return this._getStreamCandidate()?.mime || 'audio/mpeg';
+    }
+
+    _getStreamCandidate(): { format: AudioFormat; mime: string; label: string } | null {
+        const selected = normalizeStreamingFormat(this.settings.streamingFormat || 'off');
+        if (selected === 'off') return null;
+        const candidates = this._detectStreamingCandidates();
+        return candidates[0] || null;
+    }
+
+    _detectStreamingCandidates(): Array<{ format: AudioFormat; mime: string; label: string }> {
+        const candidates: Array<{ format: AudioFormat; mime: string; label: string }> = [];
+        if (window.AudioContext || (window as any).webkitAudioContext) {
+            candidates.push({ format: 'pcm', mime: 'audio/pcm', label: 'PCM / adaptive buffer' });
+        }
+        if (typeof MediaSource !== 'undefined') {
+            for (const candidate of [
+                { format: 'webm' as const, mime: 'audio/webm; codecs="opus"', label: 'WebM / Opus' },
+                { format: 'mp3' as const, mime: 'audio/mpeg', label: 'MP3 byte stream' },
+            ]) {
+                if (MediaSource.isTypeSupported(candidate.mime)) candidates.push(candidate);
+            }
+        }
+        return candidates;
+    }
+
+    _unlockPcm = () => {
+        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+        if (!Ctx) return;
+        if (!this._pcmContext || this._pcmContext.state === 'closed') this._pcmContext = new Ctx();
+        void this._pcmContext.resume();
+    };
+
+    _createPcmStream(sampleRate = 24000, channels = 1): PcmAudioStream {
+        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+        if (!this._pcmContext || this._pcmContext.state === 'closed') {
+            this._pcmContext = new Ctx();
+        }
+        const context = this._pcmContext;
+        return createPcmStream(context, sampleRate);
+    }
+
+    _appendPcmChunk(stream: PcmAudioStream, bytes: Uint8Array) { appendPcm(stream, bytes); }
+    _startPcmStream(stream: PcmAudioStream) { stream.playing = true; pumpPcm(stream); }
+    _finishPcmStream(stream: PcmAudioStream) { stream.closed = true; pumpPcm(stream); }
+    _stopPcmStream(stream: PcmAudioStream) { stopPcm(stream); }
 
     /**
      * Send queued requests to worker in order.
@@ -498,12 +643,116 @@ class PocketTtsProvider {
         }
     }
 
+    _createStream(mimeType = this._getStreamMimeType()): ActiveAudioStream | null {
+        if (!this._canStreamCurrentFormat()) {
+            console.warn('[pocketTTS-WS] provider: MediaSource mime unsupported', mimeType);
+            return null;
+        }
+
+        const mediaSource = new MediaSource();
+        mediaSource.addEventListener('sourceopen', () => console.log('[pocketTTS-WS] provider: MediaSource open', { mimeType }));
+        mediaSource.addEventListener('sourceended', () => console.log('[pocketTTS-WS] provider: MediaSource ended', { mimeType }));
+        mediaSource.addEventListener('sourceclose', () => console.log('[pocketTTS-WS] provider: MediaSource closed', { mimeType }));
+        const stream: ActiveAudioStream = {
+            mediaSource,
+            sourceBuffer: null,
+            url: URL.createObjectURL(mediaSource),
+            queue: [],
+            opened: false,
+            ended: false,
+            playable: false,
+        };
+
+        const pump = () => {
+            const sb = stream.sourceBuffer;
+            if (!sb || sb.updating) return;
+            const next = stream.queue.shift();
+            if (next) {
+                try {
+                    sb.appendBuffer(next.buffer.slice(next.byteOffset, next.byteOffset + next.byteLength) as ArrayBuffer);
+                } catch (e) {
+                    console.error('[pocketTTS-WS] provider: stream append failed', e);
+                }
+                return;
+            }
+            if (stream.ended && mediaSource.readyState === 'open') {
+                try { mediaSource.endOfStream(); } catch {}
+            }
+        };
+
+        mediaSource.addEventListener('sourceopen', () => {
+            stream.opened = true;
+            try {
+                const sb = mediaSource.addSourceBuffer(mimeType);
+                try { sb.mode = 'sequence'; } catch {}
+                stream.sourceBuffer = sb;
+                sb.addEventListener('error', () => console.error('[pocketTTS-WS] provider: SourceBuffer error', {
+                    mimeType,
+                    mediaSourceState: mediaSource.readyState,
+                    buffered: (() => {
+                        try {
+                            return Array.from({ length: sb.buffered.length }, (_, i) => [sb.buffered.start(i), sb.buffered.end(i)]);
+                        } catch {
+                            return [];
+                        }
+                    })(),
+                }));
+                sb.addEventListener('updateend', () => {
+                    if (!stream.playable) {
+                        stream.playable = true;
+                        console.log('[pocketTTS-WS] provider: MediaSource first append complete', {
+                            buffered: (() => {
+                                try {
+                                    return Array.from({ length: sb.buffered.length }, (_, i) => [sb.buffered.start(i), sb.buffered.end(i)]);
+                                } catch {
+                                    return [];
+                                }
+                            })(),
+                        });
+                        stream.onPlayable?.();
+                    }
+                    pump();
+                });
+                pump();
+            } catch (e) {
+                console.error('[pocketTTS-WS] provider: source buffer failed', e);
+            }
+        }, { once: true });
+
+        return stream;
+    }
+
+    _appendStreamChunk(stream: ActiveAudioStream, data: Uint8Array) {
+        stream.queue.push(data);
+        const sb = stream.sourceBuffer;
+        if (stream.opened && sb && !sb.updating) {
+            const next = stream.queue.shift();
+            if (next) {
+                try { sb.appendBuffer(next.buffer.slice(next.byteOffset, next.byteOffset + next.byteLength) as ArrayBuffer); } catch (e) {
+                    console.error('[pocketTTS-WS] provider: stream append failed', e);
+                }
+            }
+        }
+    }
+
+    _finishStream(stream: ActiveAudioStream) {
+        stream.ended = true;
+        const sb = stream.sourceBuffer;
+        if (stream.mediaSource.readyState === 'open' && sb && !sb.updating && stream.queue.length === 0) {
+            try { stream.mediaSource.endOfStream(); } catch {}
+        }
+    }
+
     /**
      * Retry a failed request. Resets pending state and re-sends with backoff.
      * Returns true if retry was scheduled, false if max retries reached.
      * Fix #3: Guard against duplicate retries by checking retryScheduled flag.
      */
     _retryRequest(pending, reason) {
+        if (pending.streamResolved) {
+            if (pending.pcmStream) this._finishPcmStream(pending.pcmStream);
+            return false;
+        }
         if (pending.retryScheduled) return true; // already scheduled, don't duplicate
         if (pending.retryCount >= PocketTtsProvider.MAX_RETRIES) return false;
 
@@ -560,7 +809,9 @@ class PocketTtsProvider {
             if (!connected) {
                 for (const p of this._wsPending) {
                     clearTimeout(p.timeout);
+                    if (p.pcmStream) this._finishPcmStream(p.pcmStream);
                     p.promise._reject(new Error(fatal ? 'Connection failed (reconnect limit reached)' : 'WebSocket disconnected'));
+                    p.done?._reject(new Error('WebSocket disconnected'));
                 }
                 this._wsPending = [];
                 this._audioChunks = [];
@@ -580,11 +831,87 @@ class PocketTtsProvider {
                 this._audioChunks = []; // reset in case of partial accumulation
                 return;
             }
-            this._audioChunks.push(new Uint8Array(data));
+            const bytes = new Uint8Array(data);
+            const activePcm = this._wsPending.find(p => p.streamed && p.pcmStream);
+            if (activePcm?.pcmStream) {
+                this._appendPcmChunk(activePcm.pcmStream, bytes);
+                if (!activePcm.streamResolved) {
+                    activePcm.streamResolved = true;
+                    console.log('[pocketTTS-WS] provider: pcm streaming playable', { requestId: activePcm.id });
+                    activePcm.promise._resolve({
+                        streamUrl: '',
+                        mimeType: this._getStreamMimeType(),
+                        audioStream: activePcm.pcmStream,
+                    });
+                }
+                return;
+            }
+            const streaming = this._wsPending.find(p => p.stream);
+            if (streaming?.stream) {
+                streaming.chunks.push(bytes);
+                this._appendStreamChunk(streaming.stream, bytes);
+                if (!streaming.streamResolved) {
+                    const resolveStream = () => {
+                        if (streaming.streamResolved || !streaming.stream) return;
+                        streaming.streamResolved = true;
+                        console.log('[pocketTTS-WS] provider: streaming playable', {
+                            requestId: streaming.id,
+                            chunks: streaming.chunks.length,
+                            bytes: streaming.chunks.reduce((sum, c) => sum + c.byteLength, 0),
+                        });
+                        streaming.promise._resolve({
+                            streamUrl: streaming.stream.url,
+                            mimeType: this._getStreamMimeType(),
+                        });
+                    };
+                    if (streaming.stream.playable) {
+                        resolveStream();
+                    } else {
+                        streaming.stream.onPlayable = resolveStream;
+                    }
+                }
+                return;
+            }
+            this._audioChunks.push(bytes);
             return;
         }
 
         if (type === 'json') {
+            if (msg.status === 'audio_start') {
+                const startIds = Array.isArray(msg.request_id) ? msg.request_id : [msg.request_id];
+                const firstId = startIds[0];
+                const idx = this._wsPending.findIndex(p => p.id === firstId);
+                if (idx >= 0 && msg.format === 'pcm') {
+                    const p = this._wsPending[idx];
+                    p.pcmStream = this._createPcmStream(msg.sample_rate || 24000, 1);
+                    p.streamed = true;
+                    p.streamResolved = false;
+                    console.log('[pocketTTS-WS] provider: pcm streaming started', {
+                        requestId: firstId,
+                        sampleRate: msg.sample_rate || 24000,
+                    });
+                } else if (idx >= 0 && msg.format === this._getStreamFormat()) {
+                    const p = this._wsPending[idx];
+                    const stream = this._createStream(this._getStreamMimeType());
+                    if (stream) {
+                        p.stream = stream;
+                        p.streamed = true;
+                        p.streamResolved = true;
+                        console.log('[pocketTTS-WS] provider: streaming started', {
+                            requestId: firstId,
+                            format: msg.format,
+                            mimeType: this._getStreamMimeType(),
+                        });
+                        p.promise._resolve({
+                            streamUrl: stream.url,
+                            mimeType: this._getStreamMimeType(),
+                            done: p.done,
+                        });
+                    }
+                }
+                return;
+            }
+
             if (msg.status === 'done') {
                 const doneIds = Array.isArray(msg.request_id) ? msg.request_id : [msg.request_id];
                 const timing = {
@@ -617,6 +944,36 @@ class PocketTtsProvider {
                         const p = this._wsPending.splice(idx, 1)[0];
                         clearTimeout(p.timeout);
                         this.lastTiming = timing;
+                        if (p.pcmStream) {
+                            this._finishPcmStream(p.pcmStream);
+                            p.done?._resolve();
+                            continue;
+                        }
+                        if (p.stream) {
+                            if (!p.streamResolved) {
+                                const blob = new Blob(p.chunks as BlobPart[], { type: this._getStreamMimeType() });
+                                const message = `MediaSource did not start; falling back to complete ${p.stream ? this._getStreamFormat().toUpperCase() : this.settings.format.toUpperCase()} blob.`;
+                                console.warn('[pocketTTS-WS] provider:', message, {
+                                    requestId: p.id,
+                                    chunks: p.chunks.length,
+                                    bytes: p.chunks.reduce((sum, c) => sum + c.byteLength, 0),
+                                    type: blob.type,
+                                    size: blob.size,
+                                });
+                                this._updateStreamingInfo(message);
+                                URL.revokeObjectURL(p.stream.url);
+                                p.promise._resolve({
+                                    streamUrl: URL.createObjectURL(blob),
+                                    mimeType: this._getStreamMimeType(),
+                                    done: p.done,
+                                });
+                                p.done?._resolve();
+                            } else {
+                                this._finishStream(p.stream);
+                                p.done?._resolve();
+                            }
+                            continue;
+                        }
                         // First ID in merge group gets the blob; rest get null (merged away)
                         if (di === 0 && !firstIdCancelled) {
                             const blob = new Blob(chunks as BlobPart[], { type: this._getMimeType() });
@@ -660,6 +1017,7 @@ class PocketTtsProvider {
                         // Max retries reached — reject
                         this._wsPending.splice(idx, 1);
                         p.promise._reject(new Error(reason));
+                        p.done?._reject(new Error(reason));
                     }
                 }
                 if (!errIds.length) {
@@ -692,6 +1050,7 @@ class PocketTtsProvider {
         switch (this.settings.format) {
             case 'wav': return 'audio/wav';
             case 'opus': return 'audio/opus';
+            case 'webm': return 'audio/webm';
             case 'flac': return 'audio/flac';
             case 'aac': return 'audio/aac';
             default: return 'audio/mpeg';
@@ -701,11 +1060,15 @@ class PocketTtsProvider {
     // ─── Preview ───────────────────────────────────────────────────
 
     _previewAbort = false;
+    _previewStream: PcmAudioStream | null = null;
 
     async previewTtsVoice(voiceId) {
         this._previewAbort = true; // cancel any in-flight preview
         this.audioElement.pause();
         this.audioElement.currentTime = 0;
+        if (this._previewStream) this._stopPcmStream(this._previewStream);
+        this._previewStream = null;
+        this._unlockPcm();
         // Revoke previous blob URL if any
         if (this._previewUrl) {
             URL.revokeObjectURL(this._previewUrl);
@@ -719,6 +1082,17 @@ class PocketTtsProvider {
                 if (this._previewAbort) return; // cancelled by newer preview
                 const blob = await blobPromise;
                 if (this._previewAbort) return;
+                if (blob && 'streamUrl' in blob) {
+                    if (blob.audioStream) {
+                        this._previewStream = blob.audioStream;
+                        this._startPcmStream(blob.audioStream);
+                    } else {
+                        this._previewUrl = blob.streamUrl;
+                        this.audioElement.src = blob.streamUrl;
+                        void this.audioElement.play();
+                    }
+                    return;
+                }
                 const url = URL.createObjectURL(blob);
                 this._previewUrl = url;
                 this.audioElement.src = url;
@@ -737,6 +1111,9 @@ class PocketTtsProvider {
     // ─── Cleanup ───────────────────────────────────────────────────
 
     dispose() {
+        document.removeEventListener("pointerdown", this._unlockPcm);
+        document.removeEventListener("keydown", this._unlockPcm);
+        void this._pcmContext?.close();
         for (const p of this._wsPending) clearTimeout(p.timeout);
         this._wsPending = [];
         this._doneBuffer.clear();
@@ -752,7 +1129,12 @@ class PocketTtsProvider {
 }
 
 function normalizeAudioFormat(value: string): AudioFormat {
-    return ['mp3', 'wav', 'opus', 'flac', 'aac'].includes(value)
+    return ['mp3', 'wav', 'opus', 'webm', 'flac', 'aac'].includes(value)
         ? value as AudioFormat
         : 'mp3';
+}
+
+function normalizeStreamingFormat(value: string): PocketTtsSettings['streamingFormat'] {
+    // Preserve streaming for settings saved before format selection became automatic.
+    return ['auto', 'pcm', 'webm', 'live-webm', 'mp3'].includes(value) ? 'auto' : 'off';
 }

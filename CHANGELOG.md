@@ -10,10 +10,12 @@ All notable changes to the SillyTavern PocketTTS WebSocket extension will be doc
 - **Stale Queue Cleanup**: Clearing or restarting playback now rejects old pending websocket requests, clears send/audio buffers, and starts a fresh worker instead of carrying dead pending tracks forward.
 - **Merged Track Playback**: Delayed playback by one tick after merged audio resolves so absorbed text segments can update the playable track before highlight and playback begin.
 - **Highlight Matching**: Improved highlight matching for merged tracks that span paragraphs or rendered HTML boundaries, avoiding tiny partial matches and skipping whitespace-only highlight marks.
+- **PCM Stream Playback**: Reworked experimental PCM streaming to use WebAudio sequencing with a small startup prebuffer and start/end fades, reducing clicks and preventing multiple streamed tracks from playing at once.
 
 ### Changed
 - **Narrate Interception**: Added both capture-phase and delegated click handling for `.mes_narrate`, plus keyboard activation support, to make manual narration less dependent on SillyTavern event ordering.
 - **Diagnostics**: Added detailed `[pocketTTS-WS]` console logging for activation, narrate handling, provider queueing, worker lifecycle, and websocket traffic.
+- **Streaming Transport**: When WebAudio is available, websocket requests now ask the PocketTTS server for raw PCM streaming instead of relying on browser MediaSource support for MP3/WebM containers.
 
 ## [0.4.0]
 

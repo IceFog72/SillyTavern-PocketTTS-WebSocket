@@ -27,13 +27,15 @@ declare global {
         extension_settings?: any;
         _pttsProvider?: PocketTtsProvider;
         _pttsAudio?: HTMLAudioElement;
+        _pttsGetPlayback?: () => {
+            paused: boolean; currentTime: number; duration: number; volume: number;
+            playbackRate: number; play(): Promise<void>; pause(): void; _savedVol?: number;
+        };
         _pttsRefreshPlaylist?: () => void;
         _pttsGetPlaylist?: () => PlaylistMessageView[];
         _pttsNukePlaylist?: () => void;
         _pttsNukeMsgTracks?: (msgId: number | null) => void;
         _pttsSkipTrack?: () => void;
-        _pttsHighlightToggle?: () => boolean;
-        _pttsHighlightEnabled?: () => boolean;
         _pttsNarrateCaptureHandler?: EventListener;
         _pttsNarrateKeydownCaptureHandler?: EventListener;
     }

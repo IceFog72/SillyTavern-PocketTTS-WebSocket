@@ -2,15 +2,14 @@
 // Client sends text immediately, server sends audio back when ready.
 // Sending and receiving are independent — no queue, no waiting.
 
-import type { WsClientPayload } from './types.js';
-
 let ws: WebSocket | null = null;
 let wsReady = false;
 let wsUrl = '';
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempts = 0;
-let pendingSends: WsClientPayload[] = [];  // messages buffered while reconnecting
+let pendingSends: any[] = [];  // messages buffered while reconnecting
 let explicitlyClosed = false; // Fix #18: track if worker was explicitly closed
+let allowReconnect = true;
 
 const MAX_RECONNECT_ATTEMPTS = 10;
 
@@ -24,7 +23,10 @@ function connect() {
     ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
 
+    const currentWs = ws; // Fix race condition: reference to this specific socket instance
+
     ws.onopen = () => {
+        if (ws !== currentWs) return;
         wsReady = true;
         reconnectAttempts = 0;
         postMessage({ type: 'debug', message: 'websocket open', buffered: pendingSends.length });
@@ -44,6 +46,7 @@ function connect() {
     };
 
     ws.onmessage = (event) => {
+        if (ws !== currentWs) return;
         if (event.data instanceof ArrayBuffer) {
             postMessage({ type: 'audio', data: event.data }, [event.data]);
         } else {
@@ -57,17 +60,19 @@ function connect() {
     };
 
     ws.onclose = () => {
+        if (ws !== currentWs) return;
         wsReady = false;
         ws = null;
         postMessage({ type: 'debug', message: 'websocket closed', explicitlyClosed });
         postMessage({ type: 'status', connected: false });
-        // Fix #18: Don't reconnect if explicitly closed
-        if (!explicitlyClosed) {
+        // Don't reconnect if explicitly closed or if this is a one-shot endpoint
+        if (!explicitlyClosed && allowReconnect) {
             scheduleReconnect();
         }
     };
 
     ws.onerror = () => {
+        if (ws !== currentWs) return;
         postMessage({ type: 'debug', message: 'websocket error' });
     };
 }
@@ -85,13 +90,15 @@ function scheduleReconnect() {
     reconnectTimer = setTimeout(connect, delay);
 }
 
-self.onmessage = (event: MessageEvent<{ type: string; url?: string; payload?: WsClientPayload }>) => {
+self.onmessage = (event: MessageEvent<{ type: string; url?: string; reconnect?: boolean; payload?: any }>) => {
     const { type, url, payload } = event.data;
 
     switch (type) {
         case 'init':
             wsUrl = url || '';
-            postMessage({ type: 'debug', message: 'worker init', url: wsUrl });
+            allowReconnect = event.data.reconnect !== false;
+            explicitlyClosed = false;
+            postMessage({ type: 'debug', message: 'worker init', url: wsUrl, reconnect: allowReconnect });
             connect();
             break;
 

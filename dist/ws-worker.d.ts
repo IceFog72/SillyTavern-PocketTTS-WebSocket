@@ -1,1 +1,12 @@
-export {};
+declare let ws: WebSocket | null;
+declare let wsReady: boolean;
+declare let wsUrl: string;
+declare let reconnectTimer: ReturnType<typeof setTimeout> | null;
+declare let reconnectAttempts: number;
+declare let pendingSends: any[];
+declare let explicitlyClosed: boolean;
+declare let allowReconnect: boolean;
+declare const MAX_RECONNECT_ATTEMPTS = 10;
+declare function connect(): void;
+declare function scheduleReconnect(): void;
+declare function errorMessage(error: unknown): string;

@@ -1,0 +1,12 @@
+import type { PcmAudioStream } from './types.js';
+export declare function createPcmStream(context: AudioContext, sampleRate?: number): PcmAudioStream;
+export declare function appendPcm(stream: PcmAudioStream, input: Uint8Array): void;
+export declare function stopPcm(stream: PcmAudioStream): void;
+export declare function pumpPcm(stream: PcmAudioStream): void;
+export declare function pcmDuration(stream: PcmAudioStream): number;
+export declare function pcmPosition(stream: PcmAudioStream): number;
+export declare function seekPcm(stream: PcmAudioStream, seconds: number): void;
+export declare function pausePcm(stream: PcmAudioStream): void;
+export declare function resumePcm(stream: PcmAudioStream): void;
+export declare function setPcmRate(stream: PcmAudioStream, rate: number): void;
+export declare function setPcmVolume(stream: PcmAudioStream, volume: number): void;

@@ -7,6 +7,42 @@ export function initTtsBar(extSettings) {
     let speedIndex = 3; // 1.0x
     const speeds = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5];
     let playlistVisible = false;
+    let showRemaining = false;
+    function isPocketSelected() {
+        const settings = window.extension_settings || extSettings;
+        const select = document.getElementById('tts_provider');
+        return (select?.value || settings?.tts?.currentProvider) === 'PocketTTS WebSocket';
+    }
+    function getPlayback() {
+        const pocket = isPocketSelected();
+        const element = pocket ? window._pttsAudio : document.getElementById('tts_audio');
+        if (element) {
+            bindAudio(element);
+            switchTo(element);
+        }
+        return pocket ? window._pttsGetPlayback?.() || element : element;
+    }
+    function stopPlayback() {
+        if (isPocketSelected()) {
+            const view = window._pttsGetPlaylist?.() || [];
+            const message = view.find(v => v.isPlaying) || view[0];
+            if (message) {
+                window._pttsNukeMsgTracks?.(message.msgId);
+                return;
+            }
+        }
+        else if (document.getElementById('tts_media_control')?.classList.contains('fa-stop-circle')) {
+            // SillyTavern's stop action also clears its synthesis and audio queues.
+            document.getElementById('ttsExtensionMenuItem')?.click();
+        }
+        const player = getPlayback();
+        if (player instanceof HTMLMediaElement) {
+            player.pause();
+            player.currentTime = 0;
+            player.removeAttribute('src');
+            player.load();
+        }
+    }
     // Bar visibility follows ST's TTS enabled state
     function updateBarVisibility() {
         const es = window.extension_settings || extSettings;
@@ -26,65 +62,86 @@ export function initTtsBar(extSettings) {
         if (el) {
             el.checked = !el.checked;
             el.dispatchEvent(new Event('change', { bubbles: true }));
+            if (!el.checked) {
+                if (isPocketSelected())
+                    window._pttsNukePlaylist?.();
+                else
+                    stopPlayback();
+            }
         }
         setTimeout(updateBarVisibility, 200);
     });
-    intervals.push(setInterval(() => { updateBarVisibility(); updateHighlightBtn(); }, 1000));
+    intervals.push(setInterval(updateBarVisibility, 1000));
     updateBarVisibility();
-    updateHighlightBtn();
     // Track whichever audio element is currently playing
     let boundElements = new Set();
     // Fix #6: Store event handler references for cleanup
-    const audioEventHandlers = {
-        play: (el) => () => { switchTo(el); updateState(); },
-        playing: (el) => () => { switchTo(el); updateState(); },
-        pause: () => updateState,
-        ended: () => updateState,
-        timeupdate: () => updateTime,
-        loadedmetadata: () => updateDuration,
-        volumechange: () => updateVol,
-    };
+    const audioEventHandlers = new WeakMap();
+    function getAudioHandlers(el) {
+        let handlers = audioEventHandlers.get(el);
+        if (!handlers) {
+            handlers = {
+                play: () => { if (getPlayback() === el)
+                    applyPreferences(el); updateState(); },
+                playing: () => { if (getPlayback() === el)
+                    applyPreferences(el); updateState(); },
+                pause: updateState,
+                ended: updateState,
+                timeupdate: updateTime,
+                loadedmetadata: updateDuration,
+                volumechange: updateVol,
+            };
+            audioEventHandlers.set(el, handlers);
+        }
+        return handlers;
+    }
     function bindAudio(el) {
         if (!el || boundElements.has(el))
             return;
         boundElements.add(el);
-        el.addEventListener('play', audioEventHandlers.play(el));
-        el.addEventListener('playing', audioEventHandlers.playing(el));
-        el.addEventListener('pause', audioEventHandlers.pause());
-        el.addEventListener('ended', audioEventHandlers.ended());
-        el.addEventListener('timeupdate', audioEventHandlers.timeupdate());
-        el.addEventListener('loadedmetadata', audioEventHandlers.loadedmetadata());
-        el.addEventListener('volumechange', audioEventHandlers.volumechange());
+        const handlers = getAudioHandlers(el);
+        el.addEventListener('play', handlers.play);
+        el.addEventListener('playing', handlers.playing);
+        el.addEventListener('pause', handlers.pause);
+        el.addEventListener('ended', handlers.ended);
+        el.addEventListener('timeupdate', handlers.timeupdate);
+        el.addEventListener('loadedmetadata', handlers.loadedmetadata);
+        el.addEventListener('volumechange', handlers.volumechange);
     }
     // Fix #6: Function to unbind audio elements
     function unbindAudio(el) {
         if (!el || !boundElements.has(el))
             return;
-        el.removeEventListener('play', audioEventHandlers.play(el));
-        el.removeEventListener('playing', audioEventHandlers.playing(el));
-        el.removeEventListener('pause', audioEventHandlers.pause());
-        el.removeEventListener('ended', audioEventHandlers.ended());
-        el.removeEventListener('timeupdate', audioEventHandlers.timeupdate());
-        el.removeEventListener('loadedmetadata', audioEventHandlers.loadedmetadata());
-        el.removeEventListener('volumechange', audioEventHandlers.volumechange());
+        const handlers = getAudioHandlers(el);
+        el.removeEventListener('play', handlers.play);
+        el.removeEventListener('playing', handlers.playing);
+        el.removeEventListener('pause', handlers.pause);
+        el.removeEventListener('ended', handlers.ended);
+        el.removeEventListener('timeupdate', handlers.timeupdate);
+        el.removeEventListener('loadedmetadata', handlers.loadedmetadata);
+        el.removeEventListener('volumechange', handlers.volumechange);
         boundElements.delete(el);
     }
-    function switchTo(el) {
-        if (el === audio)
-            return;
-        audio = el;
+    function applyPreferences(el) {
         const savedVol = localStorage.getItem('ptts-bar-volume');
         if (savedVol !== null)
-            audio.volume = parseFloat(savedVol);
+            el.volume = parseFloat(savedVol);
         const savedSpeed = localStorage.getItem('ptts-bar-speed');
         if (savedSpeed !== null) {
             speedIndex = speeds.indexOf(parseFloat(savedSpeed));
             if (speedIndex < 0)
                 speedIndex = 3;
-            audio.playbackRate = speeds[speedIndex];
+            el.defaultPlaybackRate = speeds[speedIndex];
+            el.playbackRate = speeds[speedIndex];
         }
-        updateVol();
         bar.speed.textContent = formatSpeed(speeds[speedIndex]);
+    }
+    function switchTo(el) {
+        if (el === audio)
+            return;
+        audio = el;
+        applyPreferences(el);
+        updateVol();
     }
     // Periodically scan for audio elements and bind them
     function scanAudioElements() {
@@ -94,49 +151,50 @@ export function initTtsBar(extSettings) {
             bindAudio(pttsEl);
         if (stEl)
             bindAudio(stEl);
-        if (!audio) {
-            audio = pttsEl || stEl;
-            if (audio) {
-                const savedVol = localStorage.getItem('ptts-bar-volume');
-                if (savedVol !== null)
-                    audio.volume = parseFloat(savedVol);
-                const savedSpeed = localStorage.getItem('ptts-bar-speed');
-                if (savedSpeed !== null) {
-                    speedIndex = speeds.indexOf(parseFloat(savedSpeed));
-                    if (speedIndex < 0)
-                        speedIndex = 3;
-                    audio.playbackRate = speeds[speedIndex];
-                }
-                updateVol();
-                bar.speed.textContent = formatSpeed(speeds[speedIndex]);
-            }
-        }
+        getPlayback();
     }
     intervals.push(setInterval(scanAudioElements, 1000));
     scanAudioElements();
     // ─── Playback state ──────────────────────────────────
     function updateState() {
+        const audio = getPlayback();
         if (!audio)
             return;
+        bar.playlistBtn.disabled = !isPocketSelected();
+        if (!isPocketSelected() && playlistVisible) {
+            playlistVisible = false;
+            bar.playlistPanel.style.display = 'none';
+            bar.splitter.style.display = 'none';
+            bar.el.style.minHeight = '35px';
+        }
         const icon = bar.playBtn.querySelector('i');
         icon.className = audio.paused ? 'fa-solid fa-play' : 'fa-solid fa-pause';
     }
     // ─── Time display ────────────────────────────────────
     function updateTime() {
+        const audio = getPlayback();
         if (!audio || seeking)
             return;
-        bar.seeker.value = audio.currentTime;
-        bar.time.textContent = formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
+        if (!seeking)
+            bar.seeker.value = audio.currentTime;
+        bar.time.textContent = showRemaining
+            ? '-' + formatTime(Math.max(0, audio.duration - audio.currentTime))
+            : formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
     }
     function updateDuration() {
+        const audio = getPlayback();
         if (!audio)
             return;
-        bar.seeker.max = audio.duration || 0;
-        bar.seeker.value = audio.currentTime;
-        bar.time.textContent = formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
+        bar.seeker.max = Number.isFinite(audio.duration) ? audio.duration : 0;
+        if (!seeking)
+            bar.seeker.value = audio.currentTime;
+        bar.time.textContent = showRemaining
+            ? '-' + formatTime(Math.max(0, audio.duration - audio.currentTime))
+            : formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
     }
     // ─── Volume ──────────────────────────────────────────
     function updateVol() {
+        const audio = getPlayback();
         if (!audio)
             return;
         bar.volSlider.value = audio.volume * 100;
@@ -153,34 +211,40 @@ export function initTtsBar(extSettings) {
     }
     // ─── Event handlers ──────────────────────────────────
     bar.playBtn.addEventListener('click', () => {
+        const audio = getPlayback();
         if (!audio)
             return;
         if (audio.paused)
-            audio.play();
+            void audio.play().catch(err => console.warn('[pocketTTS-WS] Playback failed', err));
         else
             audio.pause();
     });
     bar.seeker.addEventListener('input', () => {
+        const audio = getPlayback();
         if (!audio)
             return;
         seeking = true;
         audio.currentTime = parseFloat(bar.seeker.value);
-        bar.time.textContent = formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
+        bar.time.textContent = showRemaining
+            ? '-' + formatTime(Math.max(0, audio.duration - audio.currentTime))
+            : formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
     });
-    bar.seeker.addEventListener('change', () => { seeking = false; });
+    bar.seeker.addEventListener('change', () => { seeking = false; updateTime(); });
     bar.time.addEventListener('click', () => {
-        if (!audio)
-            return;
-        const remaining = audio.duration - audio.currentTime;
-        bar.time.textContent = '-' + formatTime(remaining);
+        showRemaining = !showRemaining;
+        updateTime();
     });
     bar.volSlider.addEventListener('input', () => {
+        const volume = parseInt(bar.volSlider.value) / 100;
+        const audio = getPlayback();
         if (!audio)
             return;
-        audio.volume = parseInt(bar.volSlider.value) / 100;
-        localStorage.setItem('ptts-bar-volume', audio.volume);
+        audio.volume = volume;
+        localStorage.setItem('ptts-bar-volume', String(volume));
+        updateVol();
     });
     bar.volBtn.addEventListener('click', () => {
+        const audio = getPlayback();
         if (!audio)
             return;
         if (audio.volume > 0) {
@@ -188,38 +252,51 @@ export function initTtsBar(extSettings) {
             audio.volume = 0;
         }
         else {
-            audio.volume = audio._savedVol || 0.5;
+            audio.volume = audio._savedVol ?? 0.5;
         }
+        localStorage.setItem('ptts-bar-volume', String(audio.volume));
         updateVol();
-        localStorage.setItem('ptts-bar-volume', audio.volume);
     });
     bar.speed.addEventListener('click', () => {
+        const audio = getPlayback();
         if (!audio)
             return;
         speedIndex = (speedIndex + 1) % speeds.length;
+        if (audio instanceof HTMLMediaElement)
+            audio.defaultPlaybackRate = speeds[speedIndex];
         audio.playbackRate = speeds[speedIndex];
         bar.speed.textContent = formatSpeed(speeds[speedIndex]);
         localStorage.setItem('ptts-bar-speed', String(speeds[speedIndex]));
+        if (!isPocketSelected()) {
+            const settings = window.extension_settings || extSettings;
+            if (settings?.tts)
+                settings.tts.playback_rate = speeds[speedIndex];
+            const input = document.getElementById('playback_rate');
+            if (input) {
+                input.value = String(speeds[speedIndex]);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        }
     });
-    // Skip track — next track in SAME message
     bar.skipBtn.addEventListener('click', () => {
-        window._pttsSkipTrack?.();
-    });
-    // Stop — nuke current message album only
-    bar.stopBtn.addEventListener('click', () => {
-        const view = window._pttsGetPlaylist?.() || [];
-        const playing = view.find(v => v.isPlaying);
-        if (playing) {
-            window._pttsNukeMsgTracks?.(playing.msgId);
+        if (isPocketSelected()) {
+            window._pttsSkipTrack?.();
+            return;
         }
-        else if (audio) {
-            audio.pause();
-            audio.currentTime = 0;
-            audio.src = '';
+        const player = getPlayback();
+        if (player instanceof HTMLMediaElement && (player.currentSrc || player.getAttribute('src'))) {
+            player.pause();
+            player.removeAttribute('src');
+            player.load();
+            // SillyTavern advances its audio queue on ended. Explicit completion
+            // avoids browsers that do not emit ended when seeking to the last sample.
+            player.dispatchEvent(new Event('ended'));
         }
     });
+    bar.stopBtn.addEventListener('click', stopPlayback);
     bar.dlBtn.addEventListener('click', () => {
-        if (!audio || !audio.src)
+        const audio = getPlayback();
+        if (!(audio instanceof HTMLMediaElement) || !audio.src)
             return;
         const es = window.extension_settings || extSettings;
         const fmt = es?.tts?.['PocketTTS WebSocket']?.format || 'mp3';
@@ -228,20 +305,16 @@ export function initTtsBar(extSettings) {
         a.download = 'tts-audio.' + fmt;
         a.click();
     });
-    // Highlight toggle — only visible for PocketTTS provider
-    function updateHighlightBtn() {
-        const es = window.extension_settings || extSettings;
-        const isPocketTts = es?.tts?.currentProvider === 'PocketTTS WebSocket';
-        bar.highlightBtn.style.display = isPocketTts ? '' : 'none';
-        const on = window._pttsHighlightEnabled?.() ?? false;
-        const icon = bar.highlightBtn.querySelector('i');
-        icon.style.opacity = on ? '1' : '0.4';
-    }
-    bar.highlightBtn.addEventListener('click', () => {
-        window._pttsHighlightToggle?.();
-        updateHighlightBtn();
-    });
-    updateHighlightBtn();
+    // Web Audio has no media-element events. Read the active player's clock
+    // so controls also update during buffering, pause, seek, and track changes.
+    intervals.push(setInterval(() => {
+        updateState();
+        if (!seeking)
+            updateDuration();
+        updateVol();
+    }, 100));
+    updateState();
+    updateDuration();
     // ─── Playlist Panel ──────────────────────────────────
     bar.playlistBtn.addEventListener('click', () => {
         playlistVisible = !playlistVisible;
@@ -295,7 +368,7 @@ export function initTtsBar(extSettings) {
         window.removeEventListener('pointerup', onPointerUp);
     }
     function renderPlaylist() {
-        if (!playlistVisible)
+        if (!playlistVisible || !isPocketSelected())
             return;
         const view = window._pttsGetPlaylist?.() || [];
         const panel = bar.playlistPanel;
@@ -330,6 +403,7 @@ export function initTtsBar(extSettings) {
     console.debug('[pocketTTS-WS] Player bar initialized');
     // Fix #6: Return comprehensive cleanup function
     return () => {
+        onPointerUp({ pointerId });
         // Clear intervals
         for (const id of intervals)
             clearInterval(id);
@@ -365,7 +439,6 @@ function createBarElements() {
                 <input type="range" id="ptts-volume" min="0" max="100" value="100" />
             </div>
             <span class="ptts-speed" id="ptts-speed" title="Click to change speed">1.0x</span>
-            <button class="ptts-btn" id="ptts-highlight" title="Highlight playing text"><i class="fa-solid fa-highlighter"></i></button>
             <button class="ptts-btn" id="ptts-playlist" title="Playlist"><i class="fa-solid fa-list"></i></button>
             <button class="ptts-btn" id="ptts-dl" title="Download" style="display:none"><i class="fa-solid fa-download"></i></button>
         </div>
@@ -403,7 +476,6 @@ function createBarElements() {
         volBtn: el.querySelector('#ptts-vol-btn'),
         volSlider: el.querySelector('#ptts-volume'),
         speed: el.querySelector('#ptts-speed'),
-        highlightBtn: el.querySelector('#ptts-highlight'),
         playlistBtn: el.querySelector('#ptts-playlist'),
         dlBtn: el.querySelector('#ptts-dl'),
         splitter,

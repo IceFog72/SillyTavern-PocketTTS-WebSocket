@@ -27,6 +27,7 @@ import { event_types, eventSource } from '../../../../../script.js';
 import { extension_settings } from '../../../../extensions.js';
 import { PocketTtsProvider } from './pocket-tts.js';
 import { initTtsBar } from './tts-bar.js';
+import { pcmPosition, pcmDuration, pausePcm, resumePcm, seekPcm, setPcmRate, setPcmVolume } from './pcm-playback.js';
 // All console output prefixed [pocketTTS-WS] for easy filtering in devtools
 const log = (...args) => console.log('[pocketTTS-WS]', ...args);
 const logDebug = (...args) => console.debug('[pocketTTS-WS]', ...args);
@@ -39,7 +40,7 @@ const adp = {
     // msgId tags each track so playlist UI can group by message.
     tracks: [],
     playingIdx: -1, // index into tracks[] of currently playing track (-1 = none)
-    playingTrack: null, // text of track currently playing (used for highlighting after cleanup)
+    playingTrack: null, // text of track currently playing
     isPlaying: false,
     timer: null, // 500ms interval that reads chat[mes].mes
     active: false, // true during generation — timer only runs when active
@@ -110,481 +111,44 @@ function getVoiceId(isUserMessage = false, charName = null) {
 // ─── Shared Audio Element ──────────────────────────────────────────
 const pttsAudio = new Audio();
 pttsAudio.id = 'ptts_audio';
-// ─── Sentence Highlighting ─────────────────────────────────────────
-// WHY a highlight layer: we need to highlight text in ST messages without
-// modifying the original DOM (ST may re-render it at any time). The highlight
-// layer is a semi-transparent overlay that mirrors the message text and wraps
-// matching portions in <mark> tags. The overlay sits on top of the original
-// text, creating a highlighting effect.
-//
-// WHY TreeWalker for text nodes: messages contain HTML (formatting, emphasis,
-// etc.). We need to find the character positions across HTML element boundaries.
-// TreeWalker visits each text node, and we build a map of [{node, start, end}]
-// so we can split and wrap arbitrary ranges.
-//
-// WHY block-boundary space injection: when the DOM has <p>Hello.</p><p>World</p>,
-// concatenating text nodes gives "Hello.World" — no space between blocks.
-// But the TTS text (from markdown) has "Hello. World" (newline → space).
-// We insert a virtual space at each block boundary so the concatenated text
-// matches what the TTS text looks like after normalization.
-//
-// WHY substring search (not word-stripping): earlier versions stripped words
-// from the playing text and searched for them individually. This broke
-// contractions ("You're" → "youre" wouldn't match "you're" in the DOM).
-// Substring search preserves the original text, including contractions.
-let highlightEnabled = localStorage.getItem('ptts-highlight') === 'true';
-// Tracks search position in original (non-normalized) DOM text space.
-// Reset when message changes (_lastHighlightMsgId).
-let lastSearchOffset = 0;
-let highlightLayer = null;
-let highlightContainer = null;
-// Block-level tags that create visual line/paragraph breaks.
-// When a text node follows one of these, there's an implicit space in the
-// rendered output that doesn't exist as a text node.
-const BLOCK_TAGS = new Set([
-    'P', 'DIV', 'BR', 'LI', 'OL', 'UL', 'BLOCKQUOTE',
-    'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TR', 'PRE', 'HR',
-]);
-// Creates or returns the highlight overlay for a message element.
-// The overlay copies font styles from the original to ensure alignment.
-function ensureHighlightLayer(msgId) {
-    const mesEl = msgId != null
-        ? document.querySelector(`.mes[mesid="${msgId}"] .mes_text`)
-        : document.querySelector('.mes.last_mes .mes_text');
-    if (!mesEl)
-        return null;
-    if (mesEl.closest('.smallSysMes'))
-        return null;
-    if (mesEl.parentElement.classList.contains('ptts-highlight-wrap')) {
-        // Wrap exists but highlightLayer may be stale — rebuild it
-        highlightLayer = mesEl.parentElement.querySelector('.ptts-highlight-layer');
-        if (highlightLayer) {
-            highlightContainer = mesEl.parentElement;
-            return highlightLayer;
-        }
-        // Fix #7: Layer is missing despite wrap existing — unwrap mes_text first, then remove empty wrap
-        const wrap = mesEl.parentElement;
-        if (wrap.parentNode) {
-            wrap.parentNode.insertBefore(mesEl, wrap);
-            mesEl.style.margin = '';
-            mesEl.style.padding = '';
-        }
-        wrap.remove();
-    }
-    const mesStyle = window.getComputedStyle(mesEl);
-    const wrap = document.createElement('div');
-    wrap.className = 'ptts-highlight-wrap';
-    wrap.style.position = 'relative';
-    wrap.style.display = mesStyle.display;
-    wrap.style.margin = mesStyle.margin;
-    mesEl.parentNode.insertBefore(wrap, mesEl);
-    wrap.appendChild(mesEl);
-    mesEl.style.margin = '0';
-    mesEl.style.padding = '0';
-    const layer = document.createElement('div');
-    layer.className = 'ptts-highlight-layer';
-    layer.style.fontFamily = mesStyle.fontFamily;
-    layer.style.fontSize = mesStyle.fontSize;
-    layer.style.fontWeight = mesStyle.fontWeight;
-    layer.style.fontStyle = mesStyle.fontStyle;
-    layer.style.lineHeight = mesStyle.lineHeight;
-    layer.style.letterSpacing = mesStyle.letterSpacing;
-    layer.style.wordSpacing = mesStyle.wordSpacing;
-    layer.style.textAlign = mesStyle.textAlign;
-    layer.style.textIndent = mesStyle.textIndent;
-    layer.style.whiteSpace = mesStyle.whiteSpace;
-    layer.style.margin = '0';
-    layer.style.padding = '0';
-    layer.style.width = mesStyle.width;
-    layer.style.boxSizing = mesStyle.boxSizing;
-    wrap.appendChild(layer);
-    highlightContainer = wrap;
-    highlightLayer = layer;
-    return layer;
+function activePcmStream() {
+    return adp.isPlaying ? adp.tracks[adp.playingIdx]?.audioStream : null;
 }
-function clearHighlight() {
-    if (highlightContainer && highlightContainer.classList.contains('ptts-highlight-wrap')) {
-        const mesText = highlightContainer.querySelector('.mes_text');
-        if (mesText && highlightContainer.parentNode) {
-            highlightContainer.parentNode.insertBefore(mesText, highlightContainer);
-            mesText.style.margin = '';
-            mesText.style.padding = '';
-        }
-        highlightContainer.remove();
-    }
-    highlightLayer = null;
-    highlightContainer = null;
-}
-// Clear only the <mark> elements without tearing down the entire highlight layer.
-// More efficient for same-message sentence transitions.
-function clearMarksOnly() {
-    if (!highlightLayer)
-        return;
-    const marks = highlightLayer.querySelectorAll('.ptts-hl-active');
-    marks.forEach(m => {
-        m.replaceWith(...m.childNodes);
-    });
-    highlightLayer.normalize(); // merge adjacent text nodes
-}
-// Check if a node is preceded by a block-level element boundary.
-// Used to inject virtual spaces between block elements in the text map.
-function _needsBlockSpace(textNode) {
-    // Walk backwards through siblings and parents to see if we just left a block
-    let node = textNode;
-    while (node) {
-        const prev = node.previousSibling;
-        if (prev) {
-            // Previous sibling is a block element → space needed
-            if (prev.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has(prev.tagName))
-                return true;
-            // Previous sibling is an element that CONTAINS block elements at its end
-            if (prev.nodeType === Node.ELEMENT_NODE) {
-                const last = prev.lastElementChild;
-                if (last && BLOCK_TAGS.has(last.tagName))
-                    return true;
-            }
-            return false;
-        }
-        // No previous sibling — check if parent itself is a block element
-        node = node.parentElement;
-        if (node && BLOCK_TAGS.has(node.tagName))
-            return true;
-    }
-    return false;
-}
-// Build text-node map from a layer element.
-// Returns { nodes: [{node, start, end}], fullText: string }
-// Handles block boundaries by injecting virtual spaces.
-function buildTextMap(layer) {
-    const nodes = [];
-    let fullText = '';
-    const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
-    let nd;
-    let isFirst = true;
-    while ((nd = walker.nextNode())) {
-        // Inject a space at block boundaries (except before the very first node)
-        if (!isFirst && _needsBlockSpace(nd)) {
-            // Only inject if fullText doesn't already end with whitespace
-            if (fullText.length > 0 && !/\s$/.test(fullText)) {
-                fullText += ' ';
-            }
-        }
-        isFirst = false;
-        const len = nd.textContent.length;
-        nodes.push({ node: nd, start: fullText.length, end: fullText.length + len });
-        fullText += nd.textContent;
-    }
-    return { nodes, fullText };
-}
-// Strip markdown formatting from TTS text to match rendered DOM.
-// TTS gets `code` but DOM has <code>code</code> — backticks don't exist in DOM.
-// TTS gets **bold** but DOM has <strong>bold</strong>, etc.
-// Also strips orphan quote marks that appear at sentence boundaries when
-// <q> elements split across sentences.
-function stripMd(s) {
-    return s
-        .replace(/`{1,3}/g, '') // backticks → <code>
-        .replace(/\*\*(.+?)\*\*/g, '$1') // **bold** → <strong>
-        .replace(/\*(.+?)\*/g, '$1') // *italic* → <em>
-        .replace(/~~(.+?)~~/g, '$1') // ~~strike~~ → <del>
-        .replace(/^["'"'\u201c\u201d\u2018\u2019]+/, '') // leading orphan quotes
-        .replace(/["'"'\u201c\u201d\u2018\u2019]+$/, ''); // trailing orphan quotes
-}
-// Normalize whitespace — collapse runs of whitespace to single space.
-// Also normalize Unicode curly quotes to ASCII for matching.
-// DOM may have newlines from HTML structure or injected block-boundary spaces.
-const normalize = (s) => s
-    .replace(/\s+/g, ' ')
-    .replace(/[\u2018\u2019\u201a\u201b]/g, "'") // curly single quotes → straight
-    .replace(/[\u201c\u201d\u201e\u201f]/g, '"'); // curly double quotes → straight
-const normalizeForWords = (s) => normalize(s)
-    .replace(/\u2026/g, '...')
-    .replace(/&lt;!--.*?--&gt;/g, ' ')
-    .replace(/[^\p{L}\p{N}']+/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-// Map a position in normalized (whitespace-collapsed) text back to the
-// corresponding position in the original text.
-function mapNormalizedPos(original, normPos) {
-    let oi = 0, ni = 0;
-    let inWhitespace = false;
-    while (ni < normPos && oi < original.length) {
-        if (/\s/.test(original[oi])) {
-            if (!inWhitespace) {
-                ni++;
-                inWhitespace = true;
-            }
-        }
-        else {
-            ni++;
-            inWhitespace = false;
-        }
-        oi++;
-    }
-    return oi;
-}
-// Map a position in original text to its corresponding normalized position.
-// Inverse of mapNormalizedPos.
-function mapOrigToNormPos(original, origPos) {
-    let ni = 0;
-    let inWhitespace = false;
-    for (let oi = 0; oi < origPos && oi < original.length; oi++) {
-        if (/\s/.test(original[oi])) {
-            if (!inWhitespace) {
-                ni++;
-                inWhitespace = true;
-            }
-        }
-        else {
-            ni++;
-            inWhitespace = false;
-        }
-    }
-    return ni;
-}
-function trimOriginalRangeWhitespace(original, start, end) {
-    let s = start;
-    let e = end;
-    while (s < e && /\s/.test(original[s]))
-        s++;
-    while (e > s && /\s/.test(original[e - 1]))
-        e--;
-    return { start: s, end: e };
-}
-function wordTokens(s) {
-    const tokens = [];
-    const re = /[\p{L}\p{N}']+/gu;
-    let match;
-    while ((match = re.exec(normalizeForWords(s)))) {
-        tokens.push(match[0]);
-    }
-    return tokens;
-}
-function buildNormalizedWordMap(original) {
-    const normalized = normalize(original);
-    const words = [];
-    const re = /[\p{L}\p{N}']+/gu;
-    let match;
-    while ((match = re.exec(normalized))) {
-        words.push({
-            value: match[0],
-            normStart: match.index,
-            normEnd: match.index + match[0].length,
-        });
-    }
-    return { normalized, words };
-}
-function findWordSpanFallback(fullText, search, normOffset) {
-    const { words } = buildNormalizedWordMap(fullText.toLowerCase());
-    const query = wordTokens(search);
-    if (words.length === 0 || query.length === 0)
-        return null;
-    const minWords = Math.min(4, query.length);
-    let best = null;
-    for (let qi = 0; qi <= query.length - minWords; qi++) {
-        for (let wi = 0; wi < words.length; wi++) {
-            if (words[wi].normEnd < normOffset)
-                continue;
-            if (words[wi].value !== query[qi])
-                continue;
-            let q = qi;
-            let w = wi;
-            let matched = 0;
-            while (q < query.length && w < words.length) {
-                if (words[w].value === query[q]) {
-                    matched++;
-                    q++;
-                    w++;
-                }
-                else if (w > wi && w - wi <= matched + 8) {
-                    w++;
-                }
-                else {
-                    break;
-                }
-            }
-            if (matched >= minWords && (!best || matched > best.matched)) {
-                best = {
-                    pos: words[wi].normStart,
-                    matchedLen: words[w - 1].normEnd - words[wi].normStart,
-                    matched,
-                };
-            }
-        }
-    }
-    if (!best && normOffset > 0) {
-        return findWordSpanFallback(fullText, search, 0);
-    }
-    return best;
-}
-function highlightForText(playingText, msgId) {
-    // Use lightweight mark clearing for same-message transitions
-    if (_lastHighlightMsgId === msgId && highlightLayer) {
-        clearMarksOnly();
-    }
-    else {
-        clearHighlight();
-    }
-    if (!highlightEnabled || !playingText)
-        return;
-    const mesEl = msgId != null
-        ? document.querySelector(`.mes[mesid="${msgId}"] .mes_text`)
-        : document.querySelector('.mes.last_mes .mes_text');
-    if (!mesEl)
-        return;
-    const layer = ensureHighlightLayer(msgId);
-    if (!layer)
-        return;
-    if (layer.innerHTML !== mesEl.innerHTML) {
-        layer.innerHTML = mesEl.innerHTML;
-    }
-    layer.style.display = 'block';
-    // Build text node map with block-boundary space injection
-    const { nodes, fullText } = buildTextMap(layer);
-    if (fullText.length === 0)
-        return;
-    // Normalize both DOM text and search text for comparison
-    const lowerFull = normalize(fullText.toLowerCase());
-    const search = normalize(stripMd(playingText.trim().toLowerCase()))
-        .replace(/\.{3,}/g, '\u2026'); // ... → … to match what ST's MD renderer produces
-    if (!search)
-        return;
-    // Convert lastSearchOffset from original-text space to normalized space
-    // so we can search in normalized space correctly.
-    const normOffset = mapOrigToNormPos(fullText, lastSearchOffset);
-    let pos = lowerFull.indexOf(search, normOffset);
-    if (pos < 0)
-        pos = lowerFull.indexOf(search, 0);
-    let matchedLen = search.length;
-    // Fallback: ST may have modified the DOM (removed reasoning, applied regex),
-    // so the full playing text no longer exists as a substring.
-    // Strategy: try progressively shorter chunks from both ends.
-    if (pos < 0) {
-        const wordSpan = findWordSpanFallback(fullText, search, normOffset);
-        if (wordSpan && (wordSpan.matched >= 8 || wordSpan.matched >= wordTokens(search).length * 0.6)) {
-            pos = wordSpan.pos;
-            matchedLen = wordSpan.matchedLen;
-        }
-    }
-    if (pos < 0) {
-        // Try longest suffix starting at sentence boundaries
-        const parts = search.split(/(?<=[.!?…])\s+/);
-        for (let i = 0; i < parts.length; i++) {
-            const suffix = parts.slice(i).join(' ');
-            if (suffix.length < Math.max(20, search.length * 0.45))
-                break;
-            const found = lowerFull.indexOf(suffix, normOffset);
-            if (found >= 0) {
-                pos = found;
-                matchedLen = suffix.length;
-                break;
-            }
-            // Also try without offset constraint
-            const found2 = lowerFull.indexOf(suffix, 0);
-            if (found2 >= 0) {
-                pos = found2;
-                matchedLen = suffix.length;
-                break;
-            }
-        }
-        // Try longest prefix
-        if (pos < 0) {
-            for (let i = parts.length; i > 0; i--) {
-                const prefix = parts.slice(0, i).join(' ');
-                if (prefix.length < Math.max(20, search.length * 0.45))
-                    break;
-                const found = lowerFull.indexOf(prefix, normOffset);
-                if (found >= 0) {
-                    pos = found;
-                    matchedLen = prefix.length;
-                    break;
-                }
-                const found2 = lowerFull.indexOf(prefix, 0);
-                if (found2 >= 0) {
-                    pos = found2;
-                    matchedLen = prefix.length;
-                    break;
-                }
-            }
-        }
-        // Last resort: try last half of text
-        if (pos < 0 && search.length > 20) {
-            const half = search.substring(Math.floor(search.length / 2));
-            const found = lowerFull.indexOf(half);
-            if (found >= 0) {
-                pos = found;
-                matchedLen = half.length;
-            }
-        }
-    }
-    if (pos < 0) {
-        log(`highlight: no match for "${search.substring(0, 40)}" in msg=${msgId}`);
-        return;
-    }
-    // Map normalized match positions back to original text positions
-    const untrimmedMatchStart = mapNormalizedPos(fullText, pos);
-    const untrimmedMatchEnd = mapNormalizedPos(fullText, pos + matchedLen);
-    const { start: matchStart, end: matchEnd } = trimOriginalRangeWhitespace(fullText, untrimmedMatchStart, untrimmedMatchEnd);
-    if (matchStart >= matchEnd)
-        return;
-    // Track offset in ORIGINAL text space (not normalized).
-    // This prevents drift from accumulating across calls.
-    lastSearchOffset = matchEnd;
-    // Wrap matching text nodes in <mark> — safe even across HTML element boundaries.
-    // Iterate in reverse so splitText doesn't invalidate subsequent node offsets.
-    for (let i = nodes.length - 1; i >= 0; i--) {
-        const { node: tNode, start: ns, end: ne } = nodes[i];
-        const ws = Math.max(matchStart, ns);
-        const we = Math.min(matchEnd, ne);
-        if (ws >= we)
-            continue;
-        if (!fullText.slice(ws, we).trim())
-            continue;
-        const ls = ws - ns;
-        const le = we - ns;
-        const nl = tNode.textContent.length;
-        if (ls >= nl || le > nl || ls < 0 || le < 0)
-            continue;
-        let target = tNode;
-        if (le < nl)
-            target.splitText(le);
-        let wrapNode = target;
-        if (ls > 0)
-            wrapNode = target.splitText(ls);
-        const mark = document.createElement('mark');
-        mark.className = 'ptts-hl-active';
-        wrapNode.parentNode.replaceChild(mark, wrapNode);
-        mark.appendChild(wrapNode);
-    }
-    const firstMark = layer.querySelector('.ptts-hl-active');
-    if (firstMark)
-        firstMark.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-}
-window._pttsHighlightToggle = function () {
-    highlightEnabled = !highlightEnabled;
-    localStorage.setItem('ptts-highlight', String(highlightEnabled));
-    if (!highlightEnabled)
-        clearHighlight();
-    return highlightEnabled;
+// Both players expose the same controls to the bar. Saved bar preferences
+// carry across sentence boundaries without relying on an idle media clock.
+const pcmPlayback = {
+    get paused() { return !activePcmStream()?.playing; },
+    get currentTime() { const stream = activePcmStream(); return stream ? pcmPosition(stream) : 0; },
+    set currentTime(value) { const stream = activePcmStream(); if (stream)
+        seekPcm(stream, value); },
+    get duration() { const stream = activePcmStream(); return stream ? pcmDuration(stream) : 0; },
+    get volume() { return activePcmStream()?.output.gain.value ?? pttsAudio.volume; },
+    set volume(value) { pttsAudio.volume = value; const stream = activePcmStream(); if (stream)
+        setPcmVolume(stream, value); },
+    get playbackRate() { return activePcmStream()?.playbackRate ?? pttsAudio.playbackRate; },
+    set playbackRate(value) { pttsAudio.defaultPlaybackRate = value; pttsAudio.playbackRate = value; const stream = activePcmStream(); if (stream)
+        setPcmRate(stream, value); },
+    play() { const stream = activePcmStream(); if (stream)
+        resumePcm(stream); return Promise.resolve(); },
+    pause() { const stream = activePcmStream(); if (stream)
+        pausePcm(stream); },
+    get _savedVol() { return pttsAudio._savedVol; },
+    set _savedVol(value) { pttsAudio._savedVol = value; },
 };
-window._pttsHighlightEnabled = function () { return highlightEnabled; };
+const getPlayback = () => activePcmStream() ? pcmPlayback : null;
+window._pttsGetPlayback = getPlayback;
+function scheduleUiTask(fn, label) {
+    setTimeout(() => {
+        try {
+            fn();
+        }
+        catch (err) {
+            console.warn(`[pocketTTS-WS] ${label} failed`, err);
+        }
+    }, 0);
+}
 // ─── Per-Message Playlist Playback ─────────────────────────────────
-// _lastHighlightMsgId: tracks which message was last highlighted for offset reset
-let _lastHighlightMsgId = null;
-function setMesTextOverflow(msgId) {
-    const el = msgId != null
-        ? document.querySelector(`.mes[mesid="${msgId}"] .mes_block`)
-        : document.querySelector('.mes.last_mes .mes_block');
-    if (el)
-        el.style.setProperty('overflow', 'auto', 'important');
-}
-function clearMesTextOverflow(msgId) {
-    const el = msgId != null
-        ? document.querySelector(`.mes[mesid="${msgId}"] .mes_block`)
-        : document.querySelector('.mes.last_mes .mes_block');
-    if (el)
-        el.style.removeProperty('overflow');
-}
+let activeTrackCleanup = null;
 function playNextInQueue() {
     if (adp.isPlaying)
         return;
@@ -611,7 +175,7 @@ function playNextInQueue() {
         return;
     }
     // Warmup audio system before first track plays
-    if (!audioWarmupDone) {
+    if (!audioWarmupDone && !item.audioStream) {
         const url = URL.createObjectURL(new Blob([new Uint8Array(44)], { type: 'audio/wav' }));
         audioWarmupDone = true;
         pttsAudio.src = url;
@@ -630,34 +194,54 @@ function playNextInQueue() {
     }
     adp.playingIdx = nextIdx;
     adp.isPlaying = true;
-    adp.playingTrack = item.text;
-    log(`play #${nextIdx} msg=${item.msgId} "${item.text.substring(0, 50)}"`);
-    setMesTextOverflow(item.msgId);
-    if (_lastHighlightMsgId !== item.msgId) {
-        lastSearchOffset = 0;
-        _lastHighlightMsgId = item.msgId;
-    }
-    highlightForText(item.text, item.msgId);
+    adp.playingTrack = item.currentText || item.text;
+    log(`play #${nextIdx} msg=${item.msgId} "${adp.playingTrack.substring(0, 50)}"`);
     refreshPlaylistUi();
     const audioEl = pttsAudio;
+    if (item.audioStream) {
+        const cleanup = () => {
+            if (activeTrackCleanup !== cleanup)
+                return;
+            activeTrackCleanup = null;
+            window._pttsProvider?._stopPcmStream(item.audioStream);
+            adp.isPlaying = false;
+            adp.playingTrack = null;
+            removePlayedMsgTracks(item.msgId, item.trackId);
+            refreshPlaylistUi();
+            playNextInQueue();
+        };
+        activeTrackCleanup = cleanup;
+        item.audioStream.onEnded = cleanup;
+        const savedVolume = localStorage.getItem('ptts-bar-volume');
+        const savedRate = localStorage.getItem('ptts-bar-speed');
+        setPcmVolume(item.audioStream, savedVolume === null ? pttsAudio.volume : Number(savedVolume));
+        setPcmRate(item.audioStream, savedRate === null ? pttsAudio.playbackRate : Number(savedRate));
+        window._pttsProvider?._startPcmStream(item.audioStream);
+        return;
+    }
     audioEl.src = item.url;
     const cleanup = () => {
+        if (activeTrackCleanup !== cleanup)
+            return;
+        activeTrackCleanup = null;
         URL.revokeObjectURL(item.url);
         adp.isPlaying = false;
         adp.playingTrack = null;
-        clearHighlight();
-        clearMesTextOverflow(item.msgId);
         // Remove played tracks for this message if no more remain
-        removePlayedMsgTracks(item.msgId, nextIdx);
+        removePlayedMsgTracks(item.msgId, item.trackId);
         refreshPlaylistUi();
         playNextInQueue();
     };
+    activeTrackCleanup = cleanup;
     audioEl.onended = cleanup;
     audioEl.onerror = cleanup;
     audioEl.play().catch(() => cleanup());
 }
 // Remove played tracks for a message when all its tracks are done
-function removePlayedMsgTracks(msgId, playedIdx) {
+function removePlayedMsgTracks(msgId, playedTrackId) {
+    const playedIdx = adp.tracks.findIndex(t => t.trackId === playedTrackId);
+    if (playedIdx < 0)
+        return;
     // Check if any tracks for this message remain unplayed (pending or after playedIdx)
     const hasRemaining = adp.tracks.some((t, i) => t.msgId === msgId && (t.pending || i > playedIdx));
     if (hasRemaining)
@@ -679,10 +263,12 @@ function removePlayedMsgTracks(msgId, playedIdx) {
     log(`cleaned msg=${msgId}: removed ${toRemove.size} played tracks`);
 }
 function skipTrack() {
-    if (!adp.isPlaying)
+    if (!adp.isPlaying || !activeTrackCleanup)
         return;
     log('skip');
     pttsAudio.pause();
+    const cleanup = activeTrackCleanup;
+    cleanup();
 }
 function nukePlaylist() {
     const count = adp.tracks.length;
@@ -692,6 +278,8 @@ function nukePlaylist() {
     for (const t of adp.tracks) {
         if (t.url)
             URL.revokeObjectURL(t.url);
+        if (t.audioStream)
+            window._pttsProvider?._stopPcmStream(t.audioStream);
     }
     // If currently playing, stop audio
     if (adp.isPlaying) {
@@ -700,9 +288,8 @@ function nukePlaylist() {
         pttsAudio.onerror = null;
         pttsAudio.removeAttribute('src');
         adp.isPlaying = false;
+        activeTrackCleanup = null;
         adp.playingTrack = null;
-        clearHighlight();
-        clearMesTextOverflow(adp.tracks[adp.playingIdx]?.msgId);
     }
     adp.tracks = [];
     adp.playingIdx = -1;
@@ -717,6 +304,8 @@ function nukeMsgTracks(msgId) {
     for (const t of removed) {
         if (t.url)
             URL.revokeObjectURL(t.url);
+        if (t.audioStream)
+            window._pttsProvider?._stopPcmStream(t.audioStream);
     }
     // If currently playing a track from this message, stop it
     if (adp.isPlaying && adp.playingIdx >= 0 && adp.playingIdx < adp.tracks.length) {
@@ -727,9 +316,8 @@ function nukeMsgTracks(msgId) {
             pttsAudio.onerror = null;
             pttsAudio.removeAttribute('src');
             adp.isPlaying = false;
+            activeTrackCleanup = null;
             adp.playingTrack = null;
-            clearHighlight();
-            clearMesTextOverflow(msgId);
         }
     }
     // Recalculate playingIdx in new array
@@ -755,7 +343,7 @@ function nukeMsgTracks(msgId) {
         playNextInQueue();
 }
 function refreshPlaylistUi() {
-    window._pttsRefreshPlaylist?.();
+    scheduleUiTask(() => window._pttsRefreshPlaylist?.(), 'playlist refresh');
 }
 function getPlaylistView() {
     const view = [];
@@ -768,14 +356,29 @@ function getPlaylistView() {
             currentMsg = { msgId: t.msgId, tracks: [], isPlaying: false };
             view.push(currentMsg);
         }
-        if (isPlaying)
-            currentMsg.isPlaying = true;
-        currentMsg.tracks.push({
-            text: t.text,
-            playing: isPlaying,
-            pending: !!t.pending,
-            error: t.error || null,
-        });
+        if (t.playlistSegments?.length) {
+            const activeSegment = t.activeSegment ?? 0;
+            if (isPlaying)
+                currentMsg.isPlaying = true;
+            for (let j = 0; j < t.playlistSegments.length; j++) {
+                currentMsg.tracks.push({
+                    text: t.playlistSegments[j],
+                    playing: isPlaying && j === activeSegment,
+                    pending: !!t.pending,
+                    error: t.error || null,
+                });
+            }
+        }
+        else {
+            if (isPlaying)
+                currentMsg.isPlaying = true;
+            currentMsg.tracks.push({
+                text: t.text,
+                playing: isPlaying,
+                pending: !!t.pending,
+                error: t.error || null,
+            });
+        }
     }
     // Fix #19: Only show phantom entry if we have a valid msgId from tracks
     if (adp.isPlaying && adp.playingTrack && adp.playingIdx < 0 && adp.tracks.length > 0) {
@@ -804,16 +407,34 @@ async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '') {
     // Add placeholder immediately (sync) — ensures correct order
     // Fix #4: Include unique trackId for reliable matching
     const trackIdx = adp.tracks.length;
-    const placeholder = { trackId: nextTrackId++, url: null, duration: 0, text, msgId, pending: true, error: null, isUser, charName };
+    const placeholder = { trackId: nextTrackId++, url: null, duration: 0, text, msgId, pending: true, error: null, isUser, charName, audioStream: null };
     adp.tracks.push(placeholder);
     log(`add #${trackIdx} msg=${msgId} "${text.substring(0, 50)}"`);
     refreshPlaylistUi();
     try {
         const blobs = [];
+        let streamed = null;
         for await (const blobPromise of provider.generateTts(text, voiceId)) {
-            const blob = await blobPromise;
-            if (blob !== null)
-                blobs.push(blob);
+            const result = await blobPromise;
+            if (result && typeof result === 'object' && 'streamUrl' in result) {
+                streamed = result;
+                break;
+            }
+            if (result !== null)
+                blobs.push(result);
+        }
+        if (streamed) {
+            placeholder.url = streamed.streamUrl;
+            placeholder.audioStream = streamed.audioStream;
+            placeholder.duration = text.length / 15;
+            placeholder.pending = false;
+            log(`stream #${trackIdx} msg=${msgId} "${text.substring(0, 40)}"`);
+            refreshPlaylistUi();
+            setTimeout(() => {
+                refreshPlaylistUi();
+                playNextInQueue();
+            }, 0);
+            return;
         }
         // If no blobs — track was merged into another, remove placeholder
         if (blobs.length === 0) {
@@ -901,7 +522,7 @@ async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '') {
         refreshPlaylistUi();
         // Merged responses resolve the playable blob before the absorbed
         // requests resolve null and append their text to this placeholder.
-        // Give those continuations a tick so highlight/playback sees the full
+        // Give those continuations a tick so playback sees the full
         // merged track text instead of only the first sentence.
         setTimeout(() => {
             refreshPlaylistUi();
@@ -1007,7 +628,7 @@ function processNewText(fullText, msgId) {
     adp.lastTextLen = fullText.length;
     adp.lastSeenPrefix = fullText;
     adp.textBuffer += newText;
-    // Split sentences and push to queue — server merges short ones
+    // Send complete sentences while the rest of the reply is arriving.
     const { sentences, remainder } = splitSentences(adp.textBuffer);
     if (sentences.length > 0) {
         adp.textBuffer = remainder;
@@ -1037,13 +658,42 @@ function onSwipe() {
             pttsAudio.removeAttribute('src');
             adp.isPlaying = false;
             adp.playingTrack = null;
-            clearHighlight();
         }
     }
     adp.lastMsgId = null;
     adp.lastTextLen = 0;
     adp.textBuffer = '';
     adp.lastSeenPrefix = '';
+    setTimeout(() => narrateCurrentLastMessageAfterSwipe(), 0);
+}
+function narrateCurrentLastMessageAfterSwipe() {
+    if (!isPocketTtsActive())
+        return;
+    const context = window.SillyTavern?.getContext?.();
+    if (!context?.chat?.length)
+        return;
+    const msgId = context.chat.length - 1;
+    const message = context.chat[msgId];
+    if (!message || message.is_system || !message.mes)
+        return;
+    if (message.is_user && !extension_settings.tts.narrate_user)
+        return;
+    const provider = window._pttsProvider;
+    provider?.resetSession('message swipe');
+    log(`swipe narrate msg=${msgId}`);
+    adp.active = true;
+    adp.isUserMsg = !!message.is_user;
+    adp.msgCharName = message.name || (message.is_user ? context.name1 : context.name2);
+    adp.bufferIsUser = adp.isUserMsg;
+    adp.bufferCharName = adp.msgCharName;
+    adp.textBuffer = '';
+    adp.lastMsgId = null;
+    adp.lastTextLen = 0;
+    adp.lastSeenPrefix = '';
+    processNewText(message.mes, msgId);
+    flushBuffer();
+    provider?.sendTextDone();
+    adp.active = false;
 }
 function onTick() {
     if (!adp.active)
@@ -1128,7 +778,6 @@ function enableStTts() {
     }
 }
 function onProviderDropdownChange() {
-    clearHighlight();
     if (isPocketTtsSelected())
         disableStTts();
     else
@@ -1152,7 +801,6 @@ function onGenerationStarted(generationType, _args, isDryRun) {
     }
     adp.active = true;
     adp.textBuffer = '';
-    lastSearchOffset = 0;
     adp.lastMsgId = null;
     adp.lastTextLen = 0;
     adp.lastSeenPrefix = '';
@@ -1180,6 +828,7 @@ export function onActivate() {
     });
     registerTtsProvider('PocketTTS WebSocket', PocketTtsProvider);
     window._pttsAudio = pttsAudio;
+    window._pttsGetPlayback = getPlayback;
     const es = window.extension_settings || extension_settings;
     const savedProvider = es.tts?.currentProvider;
     const select = document.getElementById('tts_provider');
@@ -1242,13 +891,11 @@ export function onActivate() {
         lastNarrateMsgId = id;
         lastNarrateAt = now;
         log(`narrate msg=${id}`);
-        clearHighlight();
         nukePlaylist();
         adp.active = true;
         adp.isUserMsg = !!message.is_user;
         adp.msgCharName = message.name || (message.is_user ? context.name1 : context.name2);
         adp.textBuffer = '';
-        lastSearchOffset = 0;
         adp.lastMsgId = null;
         adp.lastTextLen = 0;
         adp.lastSeenPrefix = '';
@@ -1315,11 +962,11 @@ export function onDeactivate() {
     // Clean up state
     stopPeriodicTimer();
     nukePlaylist();
-    clearHighlight();
     enableStTts();
     ttsBarCleanup?.();
     window._pttsProvider?.dispose();
     delete window._pttsProvider;
     delete window._pttsAudio;
+    delete window._pttsGetPlayback;
 }
 //# sourceMappingURL=index.js.map

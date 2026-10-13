@@ -8,6 +8,7 @@ let reconnectTimer = null;
 let reconnectAttempts = 0;
 let pendingSends = []; // messages buffered while reconnecting
 let explicitlyClosed = false; // Fix #18: track if worker was explicitly closed
+let allowReconnect = true;
 const MAX_RECONNECT_ATTEMPTS = 10;
 function connect() {
     if (ws && ws.readyState <= 1) {
@@ -17,7 +18,10 @@ function connect() {
     postMessage({ type: 'debug', message: 'connecting websocket', url: wsUrl });
     ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
+    const currentWs = ws; // Fix race condition: reference to this specific socket instance
     ws.onopen = () => {
+        if (ws !== currentWs)
+            return;
         wsReady = true;
         reconnectAttempts = 0;
         postMessage({ type: 'debug', message: 'websocket open', buffered: pendingSends.length });
@@ -37,6 +41,8 @@ function connect() {
         }
     };
     ws.onmessage = (event) => {
+        if (ws !== currentWs)
+            return;
         if (event.data instanceof ArrayBuffer) {
             postMessage({ type: 'audio', data: event.data }, [event.data]);
         }
@@ -51,16 +57,20 @@ function connect() {
         }
     };
     ws.onclose = () => {
+        if (ws !== currentWs)
+            return;
         wsReady = false;
         ws = null;
         postMessage({ type: 'debug', message: 'websocket closed', explicitlyClosed });
         postMessage({ type: 'status', connected: false });
-        // Fix #18: Don't reconnect if explicitly closed
-        if (!explicitlyClosed) {
+        // Don't reconnect if explicitly closed or if this is a one-shot endpoint
+        if (!explicitlyClosed && allowReconnect) {
             scheduleReconnect();
         }
     };
     ws.onerror = () => {
+        if (ws !== currentWs)
+            return;
         postMessage({ type: 'debug', message: 'websocket error' });
     };
 }
@@ -82,7 +92,9 @@ self.onmessage = (event) => {
     switch (type) {
         case 'init':
             wsUrl = url || '';
-            postMessage({ type: 'debug', message: 'worker init', url: wsUrl });
+            allowReconnect = event.data.reconnect !== false;
+            explicitlyClosed = false;
+            postMessage({ type: 'debug', message: 'worker init', url: wsUrl, reconnect: allowReconnect });
             connect();
             break;
         case 'send':
@@ -126,5 +138,4 @@ self.onmessage = (event) => {
 function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);
 }
-export {};
 //# sourceMappingURL=ws-worker.js.map

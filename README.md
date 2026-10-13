@@ -8,7 +8,7 @@ TTS extension for [pocket-tts-openapi](https://github.com/IceFog72/pocket-tts-op
 - Sentence-level streaming — audio plays during generation
 - Server-reported audio duration per sentence
 - Persistent WebSocket connection (single `/v1/audio/stream` endpoint)
-- Player bar with seek, volume, speed, highlight, and playlist controls
+- Player bar with seek, volume, speed, and playlist controls
 - Auto-discovered voice cloning (`.wav` voices from server)
 - CPU/GPU model selection
 - Auto-cleanup of played tracks
@@ -39,10 +39,6 @@ Text is split on sentence boundaries (`.!?…`). Short sentences (<20 chars) are
 
 Single persistent connection to `/v1/audio/stream`. Requests are fire-and-forget with sequential IDs. Audio chunks arrive independently and are matched to requests by `request_id` on `done` message.
 
-### Highlighting
-
-Text highlighting uses substring search against rendered DOM with Unicode normalization for quotes and ellipsis characters.
-
 ## Settings
 
 | Setting | Default | Description |
@@ -70,3 +66,39 @@ Or find me on the official SillyTavern Discord server.
 
 Support me:
 [Patreon](https://www.patreon.com/cw/IceFog72)
+
+## PCM streaming
+
+Set **Streaming** to **Auto** for adaptive streaming or **Off** for buffered playback.
+Auto selects a browser-supported format and prefers PCM. Saved explicit streaming formats migrate to Auto.
+
+PCM uses WebSocket and Web Audio. It does not require MediaSource or a browser audio codec.
+Click a playback control once to allow audio under the browser's autoplay policy.
+The player resamples the 24 kHz mono stream to the device rate.
+
+Playback starts with 60 ms of queued audio. The target grows after underruns and
+arrival jitter, up to 600 ms. Stable delivery lowers it toward 60 ms.
+Short final chunks drain immediately. Stop and skip cancel scheduled audio.
+
+Validation:
+
+```bash
+npm run check
+npm run build
+npm test
+npx playwright install chromium firefox webkit
+npm run test:browser
+```
+
+The browser check exercises real Web Audio in Chromium, Firefox, and WebKit.
+It checks startup, underrun recovery, final draining, and device resampling.
+
+Saved `Live WebM` settings migrate to **Auto**. Each sentence has its own request and playback destination. The removed message-level mode assumed a continuous WebM container and discarded later sentence responses.
+
+`npm run test:browser` checks adaptive playback and the complete three-sentence text → provider → playlist path in Chromium, Firefox, and WebKit. Set `TTS_TEST_ENDPOINT=http://localhost:8005` to also exercise the real WebSocket worker and server.
+
+The playback bar controls both PCM and buffered audio: pause/resume, volume/mute, speed, skip, and stop. Seeking in PCM is limited to audio already received. The seek range grows as more audio arrives. Pausing keeps the current sentence selected while synthesis continues. Received PCM is retained for seeking until its track ends or is stopped.
+
+Browser regression checks exercise the actual bar buttons and sliders, including settings carried into the next sentence.
+
+The selected TTS provider owns the controls. PocketTTS uses its PCM or buffered player. Other providers use SillyTavern’s `#tts_audio`; late events from PocketTTS cannot redirect the controls. Skip completes the current media job, and Stop uses SillyTavern’s queue reset when its stop action is available.

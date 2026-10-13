@@ -1,3 +1,4 @@
+import type { AdaptiveBuffer } from "./adaptive-buffer.js";
 export interface VoiceInfo {
     name: string;
     voice_id: string;
@@ -7,13 +8,14 @@ export interface PocketTtsSettings {
     provider_endpoint: string;
     voice: string;
     format: AudioFormat;
+    streamingFormat: 'off' | 'auto';
     speed: number;
     temperature: number;
     top_p: number;
     model: string;
     voiceMap: Record<string, string>;
 }
-export type AudioFormat = 'mp3' | 'wav' | 'opus' | 'flac' | 'aac';
+export type AudioFormat = 'mp3' | 'wav' | 'pcm' | 'opus' | 'webm' | 'flac' | 'aac';
 export interface TtsTrack {
     trackId: number;
     url: string | null;
@@ -24,6 +26,7 @@ export interface TtsTrack {
     error: string | null;
     isUser: boolean;
     charName: string;
+    audioStream?: PcmAudioStream;
 }
 export interface PlaylistTrackView {
     text: string;
@@ -42,8 +45,8 @@ export interface TimingInfo {
 }
 export interface PendingRequest {
     id: string;
-    promise: Promise<Blob | null> & {
-        _resolve: (value: Blob | null) => void;
+    promise: Promise<Blob | StreamedAudio | null> & {
+        _resolve: (value: Blob | StreamedAudio | null) => void;
         _reject: (reason?: unknown) => void;
     };
     chunks: Uint8Array[];
@@ -51,6 +54,55 @@ export interface PendingRequest {
     payload: WsTextAppendPayload | null;
     retryScheduled: boolean;
     timeout?: ReturnType<typeof setTimeout>;
+    done?: Promise<void> & {
+        _resolve: () => void;
+        _reject: (reason?: unknown) => void;
+    };
+    stream?: ActiveAudioStream;
+    pcmStream?: PcmAudioStream;
+    streamed?: boolean;
+    streamResolved?: boolean;
+}
+export interface StreamedAudio {
+    streamUrl: string;
+    mimeType: string;
+    audioStream?: PcmAudioStream;
+    done?: Promise<void>;
+}
+export interface ActiveAudioStream {
+    mediaSource: MediaSource;
+    sourceBuffer: SourceBuffer | null;
+    url: string;
+    queue: Uint8Array[];
+    opened: boolean;
+    ended: boolean;
+    playable: boolean;
+    onPlayable?: () => void;
+}
+export interface PcmAudioStream {
+    output: GainNode;
+    history: Uint8Array[];
+    totalSamples: number;
+    position: number;
+    anchorTime: number;
+    playbackRate: number;
+    buffer: AdaptiveBuffer;
+    sources: Set<AudioBufferSourceNode>;
+    pendingByte: number | null;
+    rebuffering: boolean;
+    stopped: boolean;
+    context: AudioContext;
+    sampleRate: number;
+    channels: number;
+    nextTime: number;
+    started: boolean;
+    playing: boolean;
+    closed: boolean;
+    resumeFade: boolean;
+    queue: Uint8Array[];
+    scheduledChunks: number;
+    endTimer?: ReturnType<typeof setTimeout>;
+    onEnded?: () => void;
 }
 export interface DoneBufferEntry {
     chunks: Uint8Array[];
@@ -68,6 +120,7 @@ export interface WsTextAppendPayload {
     top_p: number;
     model: string;
     retry?: boolean;
+    stream?: boolean;
 }
 export type WsClientPayload = WsTextAppendPayload | {
     type: 'text.done';
