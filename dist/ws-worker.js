@@ -6,11 +6,14 @@ let wsReady = false;
 let wsUrl = '';
 let reconnectTimer = null;
 let reconnectAttempts = 0;
+let stableTimer = null;
 let pendingSends = []; // messages buffered while reconnecting
 let explicitlyClosed = false; // Fix #18: track if worker was explicitly closed
 let allowReconnect = true;
 const MAX_RECONNECT_ATTEMPTS = 10;
 function connect() {
+    if (explicitlyClosed)
+        return;
     if (ws && ws.readyState <= 1) {
         postMessage({ type: 'debug', message: 'connect skipped: websocket already exists', readyState: ws.readyState });
         return;
@@ -23,7 +26,14 @@ function connect() {
         if (ws !== currentWs)
             return;
         wsReady = true;
-        reconnectAttempts = 0;
+        // A handshake followed by an immediate server close is not recovery.
+        // Reset backoff only after this connection remains open for 10 seconds.
+        if (stableTimer)
+            clearTimeout(stableTimer);
+        stableTimer = setTimeout(() => {
+            if (ws === currentWs && wsReady)
+                reconnectAttempts = 0;
+        }, 10000);
         postMessage({ type: 'debug', message: 'websocket open', buffered: pendingSends.length });
         postMessage({ type: 'status', connected: true });
         // Flush any messages that were buffered during disconnect
@@ -56,16 +66,25 @@ function connect() {
             }
         }
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
         if (ws !== currentWs)
             return;
+        if (stableTimer)
+            clearTimeout(stableTimer);
+        stableTimer = null;
         wsReady = false;
         ws = null;
-        postMessage({ type: 'debug', message: 'websocket closed', explicitlyClosed });
+        postMessage({ type: 'debug', message: 'websocket closed', explicitlyClosed,
+            code: event.code, reason: event.reason, wasClean: event.wasClean });
         postMessage({ type: 'status', connected: false });
         // Don't reconnect if explicitly closed or if this is a one-shot endpoint
         if (!explicitlyClosed && allowReconnect) {
-            scheduleReconnect();
+            if (event.code === 1008 || event.code === 1003) {
+                postMessage({ type: 'status', connected: false, fatal: true });
+                return;
+            }
+            const retryAfter = /retry after (\d+)s/i.exec(event.reason);
+            scheduleReconnect(retryAfter ? Number(retryAfter[1]) * 1000 : event.code === 1013 ? 5000 : 0);
         }
     };
     ws.onerror = () => {
@@ -74,7 +93,7 @@ function connect() {
         postMessage({ type: 'debug', message: 'websocket error' });
     };
 }
-function scheduleReconnect() {
+function scheduleReconnect(minimumDelay = 0) {
     if (reconnectTimer)
         clearTimeout(reconnectTimer);
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
@@ -82,7 +101,7 @@ function scheduleReconnect() {
         postMessage({ type: 'status', connected: false, fatal: true });
         return;
     }
-    const delay = Math.min(500 * Math.pow(1.5, reconnectAttempts), 5000);
+    const delay = Math.max(Math.min(500 * Math.pow(1.5, reconnectAttempts), 5000), Math.min(Math.max(0, minimumDelay), 300000));
     reconnectAttempts++;
     postMessage({ type: 'debug', message: 'scheduled reconnect', delay, reconnectAttempts });
     reconnectTimer = setTimeout(connect, delay);
@@ -122,6 +141,9 @@ self.onmessage = (event) => {
             postMessage({ type: 'debug', message: 'worker close requested' });
             if (reconnectTimer)
                 clearTimeout(reconnectTimer);
+            if (stableTimer)
+                clearTimeout(stableTimer);
+            stableTimer = null;
             pendingSends = [];
             if (ws)
                 try {

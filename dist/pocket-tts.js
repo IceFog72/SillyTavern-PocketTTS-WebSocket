@@ -191,6 +191,8 @@ class PocketTtsProvider {
         // Reject all pending promises — worker is gone, no responses will come
         for (const p of this._wsPending) {
             clearTimeout(p.timeout);
+            clearTimeout(p.retryTimer);
+            p.retryScheduled = false;
             if (p.pcmStream)
                 this._finishPcmStream(p.pcmStream);
             p.promise._reject(new Error('Worker closed'));
@@ -699,27 +701,33 @@ class PocketTtsProvider {
      * Returns true if retry was scheduled, false if max retries reached.
      * Fix #3: Guard against duplicate retries by checking retryScheduled flag.
      */
-    _retryRequest(pending, reason) {
+    _retryRequest(pending, reason, retryAfter = 0) {
         if (pending.streamResolved) {
             if (pending.pcmStream)
                 this._finishPcmStream(pending.pcmStream);
+            if (pending.stream)
+                this._finishStream(pending.stream);
             return false;
         }
         if (pending.retryScheduled)
             return true; // already scheduled, don't duplicate
         if (pending.retryCount >= PocketTtsProvider.MAX_RETRIES)
             return false;
-        const delay = PocketTtsProvider.RETRY_DELAYS[pending.retryCount] || 4000;
+        const delay = Math.max(PocketTtsProvider.RETRY_DELAYS[pending.retryCount] || 4000, Math.min(Math.max(Number(retryAfter) || 0, 0), 300) * 1000);
         pending.retryCount++;
+        if (pending.pcmStream) {
+            this._stopPcmStream(pending.pcmStream);
+            pending.pcmStream = undefined;
+        }
         pending.chunks = [];
         pending.retryScheduled = true;
         console.log('[pocketTTS-WS] retry %d/%d for %s in %dms (%s)', pending.retryCount, PocketTtsProvider.MAX_RETRIES, pending.id, delay, reason);
-        setTimeout(() => {
+        pending.retryTimer = setTimeout(() => {
+            pending.retryTimer = undefined;
             pending.retryScheduled = false;
-            // Re-add to pending if it was removed
-            if (!this._wsPending.includes(pending)) {
-                this._wsPending.push(pending);
-            }
+            // Reset/disconnect/completion owns removal. Never resurrect a job.
+            if (!this._wsPending.includes(pending) || !this._worker)
+                return;
             // Reset timeout — also retry on timeout
             clearTimeout(pending.timeout);
             pending.timeout = setTimeout(() => {
@@ -730,6 +738,7 @@ class PocketTtsProvider {
                 if (idx >= 0)
                     this._wsPending.splice(idx, 1);
                 pending.promise._reject(new Error('TTS timeout (60s)'));
+                pending.done?._reject(new Error('TTS timeout (60s)'));
             }, 60000);
             // Re-send with retry flag
             const retryPayload = { ...pending.payload, retry: true };
@@ -754,6 +763,8 @@ class PocketTtsProvider {
             if (!connected) {
                 for (const p of this._wsPending) {
                     clearTimeout(p.timeout);
+                    clearTimeout(p.retryTimer);
+                    p.retryScheduled = false;
                     if (p.pcmStream)
                         this._finishPcmStream(p.pcmStream);
                     p.promise._reject(new Error(fatal ? 'Connection failed (reconnect limit reached)' : 'WebSocket disconnected'));
@@ -878,6 +889,8 @@ class PocketTtsProvider {
                         if (cancelledIdx >= 0) {
                             const p = this._wsPending.splice(cancelledIdx, 1)[0];
                             clearTimeout(p.timeout);
+                            clearTimeout(p.retryTimer);
+                            p.retryScheduled = false;
                             p.promise._reject(new Error('TTS request cancelled'));
                         }
                         continue;
@@ -886,6 +899,8 @@ class PocketTtsProvider {
                     if (idx >= 0) {
                         const p = this._wsPending.splice(idx, 1)[0];
                         clearTimeout(p.timeout);
+                        clearTimeout(p.retryTimer);
+                        p.retryScheduled = false;
                         this.lastTiming = timing;
                         if (p.pcmStream) {
                             this._finishPcmStream(p.pcmStream);
@@ -944,21 +959,35 @@ class PocketTtsProvider {
                 return;
             }
             if (msg.status === 'error') {
-                this._audioChunks = []; // discard partial audio from failed request
                 const errIds = msg?.request_id
                     ? (Array.isArray(msg.request_id) ? msg.request_id : [msg.request_id])
                     : (requestId ? [requestId] : []);
+                // A rejected queued request must not erase another request's
+                // buffered audio that is still arriving on this socket.
+                if (errIds.includes(this._wsPending[0]?.id))
+                    this._audioChunks = [];
                 for (const rid of errIds) {
                     const idx = this._wsPending.findIndex(p => p.id === rid);
                     if (idx >= 0) {
                         const p = this._wsPending[idx];
                         clearTimeout(p.timeout);
+                        clearTimeout(p.retryTimer);
+                        p.retryScheduled = false;
                         const reason = msg?.error || error || 'Unknown error';
-                        if (this._retryRequest(p, reason)) {
+                        if (msg.retryable !== false && this._retryRequest(p, reason, msg.retry_after)) {
                             // Retry scheduled — keep in pending, don't reject
                             continue;
                         }
-                        // Max retries reached — reject
+                        // Permanent error or exhausted retries: finish delivered
+                        // audio, or release an unresolved stream's resources.
+                        if (p.pcmStream) {
+                            if (p.streamResolved)
+                                this._finishPcmStream(p.pcmStream);
+                            else
+                                this._stopPcmStream(p.pcmStream);
+                        }
+                        if (p.stream)
+                            this._finishStream(p.stream);
                         this._wsPending.splice(idx, 1);
                         p.promise._reject(new Error(reason));
                         p.done?._reject(new Error(reason));
@@ -1058,9 +1087,6 @@ class PocketTtsProvider {
         document.removeEventListener("pointerdown", this._unlockPcm);
         document.removeEventListener("keydown", this._unlockPcm);
         void this._pcmContext?.close();
-        for (const p of this._wsPending)
-            clearTimeout(p.timeout);
-        this._wsPending = [];
         this._doneBuffer.clear();
         this._audioChunks = [];
         this._cancelledIds.clear();

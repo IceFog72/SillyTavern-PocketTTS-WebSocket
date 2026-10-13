@@ -27,6 +27,52 @@ const server = createServer((req, res) => {
    browser=await engine.launch({headless:true,...options});
    const page=await browser.newPage();
    await page.goto(`http://127.0.0.1:${server.address().port}`);
+   const retries = await page.evaluate(async () => {
+    const {PocketTtsProvider} = await import('/extension/dist/pocket-tts.js');
+    const provider = new PocketTtsProvider();
+    provider.ready = true;
+    provider._updateStatus = () => {};
+    const sent = [];
+    provider._worker = {postMessage: message => sent.push(message), terminate() {}};
+    const originalSet = window.setTimeout, originalClear = window.clearTimeout;
+    const timers = new Map();
+    let next = 0, rejected = 0, doneRejected = 0;
+    window.setTimeout = (callback, delay) => { const id = ++next; timers.set(id,{callback,delay}); return id; };
+    window.clearTimeout = id => timers.delete(id);
+    const pending = id => ({id,chunks:[],retryCount:0,retryScheduled:false,
+     payload:{type:'text.append',text:'Hi.',request_id:id},
+     promise:{_reject(){rejected++;}},done:{_reject(){doneRejected++;}}});
+    const error = (id, extra) => provider._onWorkerMessage({data:{type:'json',msg:{
+     status:'error',request_id:id,error:'Rejected',...extra}}});
+    try {
+     provider._wsPending = [pending('invalid')];
+     error('invalid',{retryable:false,code:'unknown_voice'});
+     if(timers.size || provider._wsPending.length || rejected!==1 || doneRejected!==1)
+      throw Error('Permanent error was retried or left unsettled');
+     const active = pending('active'), queued = pending('queued');
+     provider._wsPending = [active,queued];
+     provider._audioChunks = [new Uint8Array([1,2])];
+     error('queued',{retryable:false});
+     if(provider._audioChunks.length!==1 || provider._wsPending[0]!==active)
+      throw Error('Queued rejection discarded active audio');
+     const delayed = pending('limited');
+     provider._wsPending.push(delayed);
+     error('limited',{retryable:true,retry_after:60});
+     const timer = [...timers.values()][0];
+     if(timers.size!==1 || timer.delay!==60000 || sent.length)
+      throw Error('Retry-After was ignored');
+     provider._closeWorker();
+     if(timers.size) throw Error('Reset left a retry timer');
+     timer.callback(); // A timer already dispatched at reset must also be inert.
+     if(provider._wsPending.length || sent.some(message=>message.type==='send'))
+      throw Error('Reset resurrected a cancelled request');
+     return {permanentErrorRetried:false,retryAfterMs:60000,cancelledRetryResurrected:false};
+    } finally {
+     window.setTimeout=originalSet; window.clearTimeout=originalClear;
+     provider.dispose();
+    }
+   });
+   console.log(name,'retry policy',JSON.stringify(retries));
    await page.evaluate(async()=>{
     window.pcm=await import('/pcm-playback.js');
     document.querySelector('button').onclick=()=>{

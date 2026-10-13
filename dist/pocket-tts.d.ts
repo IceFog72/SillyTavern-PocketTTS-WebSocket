@@ -109,7 +109,7 @@ declare class PocketTtsProvider {
      * Returns true if retry was scheduled, false if max retries reached.
      * Fix #3: Guard against duplicate retries by checking retryScheduled flag.
      */
-    _retryRequest(pending: any, reason: any): boolean;
+    _retryRequest(pending: PendingRequest, reason: string, retryAfter?: number): boolean;
     _onWorkerMessage(event: any): void;
     _getWsUrl(): string;
     _getMimeType(): "audio/wav" | "audio/opus" | "audio/webm" | "audio/flac" | "audio/aac" | "audio/mpeg";

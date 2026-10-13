@@ -102,3 +102,11 @@ The playback bar controls both PCM and buffered audio: pause/resume, volume/mute
 Browser regression checks exercise the actual bar buttons and sliders, including settings carried into the next sentence.
 
 The selected TTS provider owns the controls. PocketTTS uses its PCM or buffered player. Other providers use SillyTavern’s `#tts_audio`; late events from PocketTTS cannot redirect the controls. Skip completes the current media job, and Stop uses SillyTavern’s queue reset when its stop action is available.
+
+### Connection recovery
+
+Reconnect backoff increases after failed handshakes and short-lived connections. It resets only after a connection stays open for 10 seconds. The worker stops after 10 unsuccessful reconnect attempts, logs close codes/reasons, and respects a server retry delay when available.
+
+Speech errors with `retryable: false` fail immediately. Retryable errors honor `retry_after` in seconds. Reset, disconnect, disposal, and completion cancel delayed retries so old speech cannot reappear in a new session. An error for a queued sentence preserves audio already arriving for the active sentence.
+
+Reload SillyTavern after an extension update to replace both the provider and its Web Worker.

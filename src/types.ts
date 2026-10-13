@@ -60,6 +60,7 @@ export interface PendingRequest {
     retryCount: number;
     payload: WsTextAppendPayload | null;
     retryScheduled: boolean;
+    retryTimer?: ReturnType<typeof setTimeout>;
     timeout?: ReturnType<typeof setTimeout>;
     done?: Promise<void> & {
         _resolve: () => void;
