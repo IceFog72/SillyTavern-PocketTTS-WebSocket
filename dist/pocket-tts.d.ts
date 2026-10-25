@@ -19,6 +19,7 @@ declare class PocketTtsProvider {
     lastTiming: TimingInfo;
     _previewUrl: string | null;
     _pcmContext: AudioContext | null;
+    static MAX_IN_FLIGHT: number;
     static MAX_RETRIES: number;
     static RETRY_DELAYS: number[];
     static MODEL_OPTIONS: {
@@ -32,7 +33,6 @@ declare class PocketTtsProvider {
         streamingFormat: "auto";
         speed: number;
         temperature: number;
-        top_p: number;
         model: string;
         voiceMap: {};
     };
@@ -90,9 +90,11 @@ declare class PocketTtsProvider {
     _startPcmStream(stream: PcmAudioStream): void;
     _finishPcmStream(stream: PcmAudioStream): void;
     _stopPcmStream(stream: PcmAudioStream): void;
+    _startTimeout(pending: PendingRequest): void;
     /**
      * Send queued requests to worker in order.
-     * Fire-and-forget: sends all queued items, doesn't wait for responses.
+     * Keeps at most MAX_IN_FLIGHT phrases sent but unfinished, so narrating a
+     * long message stays within the server's per-socket queue and rate limit.
      * Called after each generateTts push and after each done/error received.
      */
     _flushSendQueue(): void;

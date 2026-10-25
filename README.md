@@ -48,9 +48,14 @@ Single persistent connection to `/v1/audio/stream`. Requests are fire-and-forget
 | Audio Format | `mp3` | mp3, wav, opus, flac, aac |
 | Speed | `1.0` | 0.5–2.0 |
 | Temperature | `1.0` | 0.0–2.0 |
-| Top P | `1.0` | 0.0–1.0 |
 
 Voice mapping: SillyTavern's TTS Voice Map section.
+
+With SillyTavern's **Multi-voice** option enabled, the voice map lists `Name ("Quotes")`, `Name (*Text inside asterisks*)` and `Name (Other text)` for each character. Streaming text is cut at each quote or asterisk, and the next segment continues with its own voice. Quotes and asterisks are not spoken. A segment set to `disabled` is skipped. A character without segment entries uses its plain voice.
+
+With SillyTavern's **Only narrate "quotes"** option enabled, only quoted text is spoken, and it still streams as it arrives. As in SillyTavern, a message without any quote is narrated in full. That is known only when the message ends, so such a message starts playing after generation finishes.
+
+The extension keeps at most 4 phrases in flight on the socket. A long message narrated at once stays within the server's per-socket queue and rate limit.
 
 ### GPU VRAM Overhead (CUDA Context)
 When using a `-gpu` model variant, you may notice a lingering ~170 MB of VRAM usage even after TTS generation finishes and you switch back to a `-cpu` model. **This is not a memory leak.**

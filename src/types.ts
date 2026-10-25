@@ -12,7 +12,6 @@ export interface PocketTtsSettings {
     streamingFormat: 'off' | 'auto';
     speed: number;
     temperature: number;
-    top_p: number;
     model: string;
     voiceMap: Record<string, string>;
 }
@@ -58,6 +57,7 @@ export interface PendingRequest {
     };
     chunks: Uint8Array[];
     retryCount: number;
+    sent?: boolean;
     payload: WsTextAppendPayload | null;
     retryScheduled: boolean;
     retryTimer?: ReturnType<typeof setTimeout>;
@@ -130,7 +130,6 @@ export interface WsTextAppendPayload {
     format: AudioFormat;
     speed: number;
     temperature: number;
-    top_p: number;
     model: string;
     retry?: boolean;
     stream?: boolean;

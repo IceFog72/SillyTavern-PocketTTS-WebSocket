@@ -145,6 +145,109 @@ const server = createServer((req, res) => {
     return {requests:requests.length,played:played.length,remaining:queue.adp.tracks.length};
    });
    console.log(name,'multi-sentence',JSON.stringify(playlist));
+   const multiVoice = await page.evaluate(async()=>{
+    const queue = await import('/extension/dist/index.js');
+    const {PocketTtsProvider} = await import('/extension/dist/pocket-tts.js');
+    const provider = new PocketTtsProvider();
+    provider.settings = {...provider.defaultSettings, streamingFormat:'off'};
+    provider.ready = true;
+    window._pttsProvider = provider;
+    const requests = [];
+    provider._worker = {postMessage(message) { if(message.type==='send') requests.push(message.payload); }, terminate() {}};
+    window.extension_settings = {tts:{multi_voice_enabled:true,'PocketTTS WebSocket':{voiceMap:{
+     'Mona ("Quotes")':'Mona','Mona (*Text inside asterisks*)':'alba','Mona (Other text)':'disabled'}}}};
+    try {
+     queue.adp.active = true;
+     queue.adp.lastMsgId = null;
+     queue.adp.isUserMsg = false;
+     queue.adp.msgCharName = 'Mona';
+     // Streaming ticks cut inside the action and inside the quote.
+     const full = 'She waves. *Smiles softly. Leans in.* "Hello there. How are you?" Narration.';
+     for (const end of [25, 60, full.length]) queue.processNewText(full.slice(0, end), 9);
+     queue.flushBuffer();
+     const sent = requests.map(r=>[r.voice, r.text]);
+     const expected = [['alba','Smiles softly.'],['alba','Leans in.'],['Mona','Hello there.'],['Mona','How are you?']];
+     if (JSON.stringify(sent) !== JSON.stringify(expected)) throw Error('Multi-voice segments wrong: '+JSON.stringify(sent));
+     return {segments:sent.length};
+    } finally {
+     delete window.extension_settings;
+     provider._closeWorker();
+     queue.adp.tracks.length = 0;
+     queue.adp.active = false;
+    }
+   });
+   console.log(name,'multi-voice',JSON.stringify(multiVoice));
+   const quotedOnly = await page.evaluate(async()=>{
+    const queue = await import('/extension/dist/index.js');
+    const {PocketTtsProvider} = await import('/extension/dist/pocket-tts.js');
+    const provider = new PocketTtsProvider();
+    provider.settings = {...provider.defaultSettings, streamingFormat:'off'};
+    provider.ready = true;
+    window._pttsProvider = provider;
+    provider._worker = {postMessage() {}, terminate() {}};
+    // Requested phrases, sent or still waiting behind the in-flight limit.
+    const take = () => {
+     const texts = provider._wsPending.map(p => p.payload.text);
+     provider._wsPending = [];
+     provider._sendQueue = [];
+     return texts;
+    };
+    window.extension_settings = {tts:{narrate_quoted_only:true,'PocketTTS WebSocket':{voiceMap:{}}}};
+    const narrate = (text, msgId) => {
+     queue.adp.lastMsgId = null;
+     for (const end of [20, text.length]) queue.processNewText(text.slice(0, end), msgId);
+     const beforeEnd = provider._wsPending.length;
+     queue.flushBuffer();
+     return beforeEnd;
+    };
+    try {
+     queue.adp.active = true;
+     queue.adp.msgCharName = 'Mona';
+     narrate('She waves. *Smiles.* "Hello there. How are you?" She leaves.', 10);
+     const quoted = take();
+     if (JSON.stringify(quoted) !== JSON.stringify(['Hello there.','How are you?'])) throw Error('Quoted-only sent: '+JSON.stringify(quoted));
+     const beforeEnd = narrate('No dialogue here. *She sighs.* Just narration.', 11);
+     const unquoted = take();
+     if (beforeEnd !== 0) throw Error('Unquoted text was sent before the message ended');
+     if (JSON.stringify(unquoted) !== JSON.stringify(['No dialogue here.','She sighs.','Just narration.'])) throw Error('Unquoted message not narrated in full: '+JSON.stringify(unquoted));
+     return {quoted:quoted.length, unquotedFallback:unquoted.length};
+    } finally {
+     delete window.extension_settings;
+     provider._closeWorker();
+     queue.adp.tracks.length = 0;
+     queue.adp.active = false;
+    }
+   });
+   console.log(name,'quoted-only',JSON.stringify(quotedOnly));
+   const pacing = await page.evaluate(async()=>{
+    const {PocketTtsProvider} = await import('/extension/dist/pocket-tts.js');
+    const provider = new PocketTtsProvider();
+    provider.settings = {...provider.defaultSettings, streamingFormat:'off'};
+    provider.ready = true;
+    const sent = [];
+    provider._worker = {postMessage(message) { if(message.type==='send') sent.push(message.payload); }, terminate() {}};
+    try {
+     // A whole long message arrives at once, as with swipe or manual narrate.
+     for (let i = 0; i < 40; i++) void provider.generateTts(`Sentence ${i}.`, 'alba').next();
+     provider.sendTextDone();
+     const max = PocketTtsProvider.MAX_IN_FLIGHT;
+     if (sent.length !== max) throw Error(`Burst sent ${sent.length} phrases, expected ${max}`);
+     if ('top_p' in sent[0]) throw Error('Ignored top_p is still sent');
+     const order = [];
+     while (sent.length) {
+      const payload = sent.shift();
+      order.push(payload.type === 'text.done' ? 'done' : payload.request_id);
+      if (payload.type === 'text.done') continue;
+      provider._onWorkerMessage({data:{type:'audio',data:new Uint8Array(2).buffer}});
+      provider._onWorkerMessage({data:{type:'json',msg:{status:'done',request_id:[payload.request_id]}}});
+      if (provider._wsPending.filter(p=>p.sent).length > max) throw Error('In-flight limit exceeded');
+     }
+     const expected = [...Array.from({length:40},(_,i)=>'r'+i), 'done'];
+     if (JSON.stringify(order) !== JSON.stringify(expected)) throw Error('Paced send order wrong: '+order.join(','));
+     return {phrases:40, maxInFlight:max, textDoneLast:true};
+    } finally { provider.dispose(); }
+   });
+   console.log(name,'pacing',JSON.stringify(pacing));
    await page.click('button');
    const controls=await page.evaluate(async()=>{
     const queue=await import('/extension/dist/index.js');

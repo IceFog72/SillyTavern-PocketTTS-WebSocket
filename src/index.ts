@@ -57,6 +57,10 @@ const adp = {
     msgCharName: '',       // character name from current message (name property)
     bufferIsUser: false,   // isUser captured when buffer started (for this message)
     bufferCharName: '',    // charName captured when buffer started (for this message)
+    segmentType: 'other' as SegmentType, // multi-voice segment the buffer belongs to
+    segmentCloser: '',     // delimiter that ends the current dialogue/action segment
+    sawQuote: false,       // current message had a quote ("Only narrate quotes")
+    unquoted: [] as { text: string; segmentType: SegmentType }[], // held until message end
 };
 
 
@@ -93,12 +97,82 @@ function splitSentences(text) {
     return { sentences: result, remainder };
 }
 
+// ─── Multi-voice Segments ──────────────────────────────────────────
+// Same segment types and voice map keys as ST's multi-voice parser:
+// *asterisks* are actions, quoted text is dialogue, the rest is other text.
+// Streaming text is cut at each delimiter, and the next segment continues
+// with its own voice. Delimiters are not spoken.
+
+type SegmentType = 'dialogue' | 'action' | 'other';
+
+const QUOTE_CLOSERS: Record<string, string> = {
+    '"': '"', '“': '”', '«': '»',
+    '「': '」', '『': '』', '＂': '＂',
+};
+
+const SEGMENT_VOICE_SUFFIX: Record<SegmentType, string> = {
+    dialogue: ' ("Quotes")',
+    action: ' (*Text inside asterisks*)',
+    other: ' (Other text)',
+};
+
+function isMultiVoiceEnabled() {
+    const es = window.extension_settings || extension_settings;
+    return es?.tts?.multi_voice_enabled === true;
+}
+
+function isQuotedOnly() {
+    const es = window.extension_settings || extension_settings;
+    return es?.tts?.narrate_quoted_only === true;
+}
+
+function appendText(text) {
+    if (!isMultiVoiceEnabled() && !isQuotedOnly()) {
+        adp.textBuffer += text;
+        return;
+    }
+    for (const ch of text) {
+        if (adp.segmentType === 'other') {
+            const closer = ch === '*' ? '*' : QUOTE_CLOSERS[ch];
+            if (closer) {
+                cutSegment();
+                adp.segmentType = ch === '*' ? 'action' : 'dialogue';
+                adp.segmentCloser = closer;
+                if (adp.segmentType === 'dialogue') {
+                    adp.sawQuote = true;
+                    adp.unquoted = [];
+                }
+                continue;
+            }
+        // Like ST, a quote does not continue past a line break.
+        } else if (ch === adp.segmentCloser || (adp.segmentType === 'dialogue' && ch === '\n')) {
+            cutSegment();
+            adp.segmentType = 'other';
+            adp.segmentCloser = '';
+            if (ch !== '\n') continue;
+        }
+        adp.textBuffer += ch;
+    }
+}
+
+// "Only narrate quotes" follows ST: a message without any quote is narrated
+// in full. That is known only when the message ends, so unquoted text is
+// held until then and dropped as soon as a quote appears.
+function sendSegment(text: string, segmentType: SegmentType = adp.segmentType) {
+    if (isQuotedOnly() && segmentType !== 'dialogue') {
+        if (!adp.sawQuote) adp.unquoted.push({ text, segmentType });
+        return;
+    }
+    adpGenerateAndPlay(adp.lastMsgId, text, adp.bufferIsUser, adp.bufferCharName, segmentType);
+}
+
 // ─── Voice Resolution ──────────────────────────────────────────────
 // WHY per-character voice mapping: different characters in ST can have
 // different TTS voices. The voice map is stored in extension settings
 // and looked up by character name.
 
-function getVoiceId(isUserMessage = false, charName = null) {
+// Returns null when the voice map disables this multi-voice segment.
+function getVoiceId(isUserMessage = false, charName = null, segmentType: SegmentType = 'other') {
     const provider = window._pttsProvider;
     const es = window.extension_settings || extension_settings;
     const voiceMap = es?.tts?.['PocketTTS WebSocket']?.voiceMap || {};
@@ -108,7 +182,11 @@ function getVoiceId(isUserMessage = false, charName = null) {
         ? (window.SillyTavern?.getContext?.()?.name1 || 'User')
         : (window.SillyTavern?.getContext?.()?.name2 || '[Default Voice]'));
 
-    let voiceId = voiceMap[name];
+    // ST's voice map lists "Name ("Quotes")" etc. while multi-voice is on.
+    // A character without segment entries keeps its plain voice.
+    let voiceId = isMultiVoiceEnabled() ? voiceMap[name + SEGMENT_VOICE_SUFFIX[segmentType]] : undefined;
+    if (voiceId === 'disabled') return null;
+    voiceId ??= voiceMap[name];
     // Fallback for user messages: try "User" if actual name not found
     if (!voiceId && isUserMessage) voiceId = voiceMap['User'];
     // Fix #13: Avoid circular fallback where voiceMap['[Default Voice]'] === '[Default Voice]'
@@ -424,14 +502,18 @@ window._pttsSkipTrack = skipTrack;
 
 // ─── TTS Generation ────────────────────────────────────────────────
 
-async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '') {
+async function adpGenerateAndPlay(msgId, text, isUser = false, charName = '', segmentType: SegmentType = 'other') {
     if (!text || msgId == null) return;
     const provider = window._pttsProvider;
     if (!provider || !provider.ready) return;
 
     // Use captured voice info
-    const voiceId = getVoiceId(isUser, charName);
-    log(`[tts] voice: ${voiceId} (${charName}${isUser ? ' user' : ''})`);
+    const voiceId = getVoiceId(isUser, charName, segmentType);
+    if (voiceId === null) {
+        log(`[tts] ${segmentType} voice disabled (${charName}), skipping "${text.substring(0, 40)}"`);
+        return;
+    }
+    log(`[tts] voice: ${voiceId} (${charName}${isUser ? ' user' : ''}, ${segmentType})`);
 
     // Add placeholder immediately (sync) — ensures correct order
     // Fix #4: Include unique trackId for reliable matching
@@ -584,11 +666,26 @@ function stopPeriodicTimer() {
 }
 
 // Flush any remaining text in the global buffer as a track
+function cutSegment() {
+    if (adp.lastMsgId == null) return;
+    // A segment cut can leave several complete sentences in the buffer.
+    const { sentences, remainder } = splitSentences(adp.textBuffer);
+    for (const text of [...sentences, remainder.trimStart()]) {
+        if (text.trim().length > 0) sendSegment(text);
+    }
+    adp.textBuffer = '';
+}
+
+// End of message: send the rest, and an unquoted message in full.
 function flushBuffer() {
-    const text = adp.textBuffer.trimStart();
-    if (text.length > 0 && adp.lastMsgId != null) {
-        adpGenerateAndPlay(adp.lastMsgId, text, adp.bufferIsUser, adp.bufferCharName);
-        adp.textBuffer = '';
+    cutSegment();
+    if (adp.lastMsgId == null) return;
+    const held = adp.unquoted;
+    adp.unquoted = [];
+    if (!adp.sawQuote) {
+        for (const { text, segmentType } of held) {
+            adpGenerateAndPlay(adp.lastMsgId, text, adp.bufferIsUser, adp.bufferCharName, segmentType);
+        }
     }
 }
 
@@ -605,6 +702,10 @@ function processNewText(fullText, msgId) {
         adp.lastTextLen = 0;
         adp.textBuffer = '';
         adp.lastSeenPrefix = '';
+        adp.segmentType = 'other';
+        adp.segmentCloser = '';
+        adp.sawQuote = false;
+        adp.unquoted = [];
         // Capture voice info for THIS message's buffer
         adp.bufferIsUser = adp.isUserMsg;
         adp.bufferCharName = adp.msgCharName;
@@ -617,6 +718,10 @@ function processNewText(fullText, msgId) {
         adp.lastTextLen = 0;
         adp.textBuffer = '';
         adp.lastSeenPrefix = '';
+        adp.segmentType = 'other';
+        adp.segmentCloser = '';
+        adp.sawQuote = false;
+        adp.unquoted = [];
     }
 
     if (!fullText || fullText.length <= adp.lastTextLen) return;
@@ -663,15 +768,13 @@ function processNewText(fullText, msgId) {
     const newText = fullText.substring(adp.lastTextLen);
     adp.lastTextLen = fullText.length;
     adp.lastSeenPrefix = fullText;
-    adp.textBuffer += newText;
+    appendText(newText);
 
     // Send complete sentences while the rest of the reply is arriving.
     const { sentences, remainder } = splitSentences(adp.textBuffer);
     if (sentences.length > 0) {
         adp.textBuffer = remainder;
-        for (const sentence of sentences) {
-            adpGenerateAndPlay(adp.lastMsgId, sentence, adp.bufferIsUser, adp.bufferCharName);
-        }
+        for (const sentence of sentences) sendSegment(sentence);
     }
 }
 
@@ -770,15 +873,13 @@ let audioWarmupDone = false;
 
 const ST_KEYS = [
     'auto_generation', 'periodic_auto_generation', 'narrate_by_paragraphs',
-    'narrate_quoted_only', 'narrate_dialogues_only', 'narrate_translated_only',
-    'skip_codeblocks', 'skip_tags', 'pass_asterisks',
-    'multi_voice_enabled', 'apply_regex',
+    'narrate_dialogues_only', 'narrate_translated_only',
+    'skip_codeblocks', 'skip_tags', 'pass_asterisks', 'apply_regex',
 ];
 const ST_CHECKBOXES = [
     'tts_auto_generation', 'tts_periodic_auto_generation', 'tts_narrate_by_paragraphs',
-    'tts_narrate_quoted', 'tts_narrate_dialogues', 'tts_narrate_translated_only',
-    'tts_skip_codeblocks', 'tts_skip_tags', 'tts_pass_asterisks',
-    'tts_multi_voice_enabled', 'tts_apply_regex',
+    'tts_narrate_dialogues', 'tts_narrate_translated_only',
+    'tts_skip_codeblocks', 'tts_skip_tags', 'tts_pass_asterisks', 'tts_apply_regex',
 ];
 
 let stSettingsSaved = null;

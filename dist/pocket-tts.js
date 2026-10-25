@@ -30,6 +30,9 @@ class PocketTtsProvider {
     lastTiming = { audio_duration: 0, gen_time: 0 };
     _previewUrl = null;
     _pcmContext = null;
+    // Enough to keep the sequential server busy; far below its 32-phrase
+    // socket queue and 30-per-minute default rate limit.
+    static MAX_IN_FLIGHT = 4;
     static MAX_RETRIES = 3;
     static RETRY_DELAYS = [1000, 2000, 4000];
     static MODEL_OPTIONS = [
@@ -43,7 +46,6 @@ class PocketTtsProvider {
         streamingFormat: 'auto',
         speed: 1.0,
         temperature: 0.3,
-        top_p: 1.0,
         model: 'english-cpu',
         voiceMap: {},
     };
@@ -92,10 +94,6 @@ class PocketTtsProvider {
             <label for="ptts_temperature">Temperature: <span id="ptts_temperature_val">${this.defaultSettings.temperature}</span></label>
             <input id="ptts_temperature" type="range" min="0.0" max="2.0" step="0.1"
                 value="${this.defaultSettings.temperature}" />
-
-            <label for="ptts_top_p">Top P: <span id="ptts_top_p_val">${this.defaultSettings.top_p}</span></label>
-            <input id="ptts_top_p" type="range" min="0.0" max="1.0" step="0.05"
-                value="${this.defaultSettings.top_p}" />
         </div>
         `;
     }
@@ -149,10 +147,8 @@ class PocketTtsProvider {
         this.settings.streamingFormat = normalizeStreamingFormat(String($('#ptts_streaming_format').val()));
         this.settings.speed = parseFloat($('#ptts_speed').val());
         this.settings.temperature = parseFloat($('#ptts_temperature').val());
-        this.settings.top_p = parseFloat($('#ptts_top_p').val());
         $('#ptts_speed_val').text(this.settings.speed);
         $('#ptts_temperature_val').text(this.settings.temperature);
-        $('#ptts_top_p_val').text(this.settings.top_p);
         this._updateStreamingInfo();
         if (this.settings.provider_endpoint !== oldEndpoint) {
             this._closeWorker();
@@ -235,8 +231,6 @@ class PocketTtsProvider {
         $('#ptts_speed_val').text(this.settings.speed);
         $('#ptts_temperature').val(this.settings.temperature);
         $('#ptts_temperature_val').text(this.settings.temperature);
-        $('#ptts_top_p').val(this.settings.top_p);
-        $('#ptts_top_p_val').text(this.settings.top_p);
         // Fix #17: Use namespaced events to prevent duplicate listeners on reinit
         $('#ptts_endpoint').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
         $('#ptts_model').off('change.ptts').on('change.ptts', () => this.onSettingsChange());
@@ -244,7 +238,6 @@ class PocketTtsProvider {
         $('#ptts_streaming_format').off('change.ptts').on('change.ptts', () => this.onSettingsChange());
         $('#ptts_speed').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
         $('#ptts_temperature').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
-        $('#ptts_top_p').off('input.ptts').on('input.ptts', () => this.onSettingsChange());
         window._pttsProvider = this;
         await this._loadVoices();
         await this._loadModels();
@@ -445,17 +438,6 @@ class PocketTtsProvider {
         void done.catch(() => { });
         const pending = { id: reqId, promise: blobPromise, done, chunks: [], retryCount: 0, payload: null, retryScheduled: false };
         this._wsPending.push(pending);
-        pending.timeout = setTimeout(() => {
-            const idx = this._wsPending.indexOf(pending);
-            if (idx >= 0) {
-                if (this._retryRequest(pending, 'timeout')) {
-                    return; // retry scheduled
-                }
-                this._cancelledIds.add(pending.id);
-                this._wsPending.splice(idx, 1);
-            }
-            blobPromise._reject(new Error('TTS timeout (60s)'));
-        }, 60000);
         // Push to send queue — maintains text order
         const streamCandidate = this._getStreamCandidate();
         const stream = streamCandidate !== null;
@@ -473,7 +455,6 @@ class PocketTtsProvider {
             format: wireFormat,
             speed: this.settings.speed,
             temperature: this.settings.temperature,
-            top_p: this.settings.top_p,
             model: this.settings.model,
             stream,
         };
@@ -545,9 +526,26 @@ class PocketTtsProvider {
     _startPcmStream(stream) { stream.playing = true; pumpPcm(stream); }
     _finishPcmStream(stream) { stream.closed = true; pumpPcm(stream); }
     _stopPcmStream(stream) { stopPcm(stream); }
+    // Each sent phrase gets 60s to finish. Phrases still waiting in the send
+    // queue have no deadline yet.
+    _startTimeout(pending) {
+        clearTimeout(pending.timeout);
+        pending.timeout = setTimeout(() => {
+            const idx = this._wsPending.indexOf(pending);
+            if (this._retryRequest(pending, 'timeout'))
+                return;
+            this._cancelledIds.add(pending.id);
+            if (idx >= 0)
+                this._wsPending.splice(idx, 1);
+            pending.promise._reject(new Error('TTS timeout (60s)'));
+            pending.done?._reject(new Error('TTS timeout (60s)'));
+            this._flushSendQueue();
+        }, 60000);
+    }
     /**
      * Send queued requests to worker in order.
-     * Fire-and-forget: sends all queued items, doesn't wait for responses.
+     * Keeps at most MAX_IN_FLIGHT phrases sent but unfinished, so narrating a
+     * long message stays within the server's per-socket queue and rate limit.
      * Called after each generateTts push and after each done/error received.
      */
     _flushSendQueue() {
@@ -564,11 +562,27 @@ class PocketTtsProvider {
         }
         console.log('[pocketTTS-WS] provider: flushing send queue', { count: this._sendQueue.length });
         while (this._sendQueue.length > 0) {
-            const payload = this._sendQueue.shift();
+            const payload = this._sendQueue[0];
+            let pending;
+            if (payload.type === 'text.append') {
+                pending = this._wsPending.find(p => p.payload === payload);
+                if (!pending) {
+                    // Cancelled, reset or disconnected before it was sent.
+                    this._sendQueue.shift();
+                    continue;
+                }
+                if (this._wsPending.filter(p => p.sent).length >= PocketTtsProvider.MAX_IN_FLIGHT)
+                    break;
+            }
+            this._sendQueue.shift();
             console.log('[pocketTTS-WS] provider: post worker payload', {
-                type: payload?.type,
-                requestId: payload && 'request_id' in payload ? payload.request_id : null,
+                type: payload.type,
+                requestId: 'request_id' in payload ? payload.request_id : null,
             });
+            if (pending) {
+                pending.sent = true;
+                this._startTimeout(pending);
+            }
             this._worker.postMessage({ type: 'send', payload });
         }
     }
@@ -579,8 +593,9 @@ class PocketTtsProvider {
     sendTextDone() {
         if (this._worker) {
             console.log('[pocketTTS-WS] provider: send text.done');
+            // Queued behind unsent phrases so the server ends after them.
+            this._sendQueue.push({ type: 'text.done' });
             this._flushSendQueue();
-            this._worker.postMessage({ type: 'send', payload: { type: 'text.done' } });
         }
         else {
             console.warn('[pocketTTS-WS] provider: text.done skipped, worker missing');
@@ -729,17 +744,7 @@ class PocketTtsProvider {
             if (!this._wsPending.includes(pending) || !this._worker)
                 return;
             // Reset timeout — also retry on timeout
-            clearTimeout(pending.timeout);
-            pending.timeout = setTimeout(() => {
-                const idx = this._wsPending.indexOf(pending);
-                if (this._retryRequest(pending, 'timeout'))
-                    return;
-                this._cancelledIds.add(pending.id);
-                if (idx >= 0)
-                    this._wsPending.splice(idx, 1);
-                pending.promise._reject(new Error('TTS timeout (60s)'));
-                pending.done?._reject(new Error('TTS timeout (60s)'));
-            }, 60000);
+            this._startTimeout(pending);
             // Re-send with retry flag
             const retryPayload = { ...pending.payload, retry: true };
             if (this._worker) {
@@ -772,6 +777,7 @@ class PocketTtsProvider {
                 }
                 this._wsPending = [];
                 this._audioChunks = [];
+                this._sendQueue = [];
             }
             return;
         }
@@ -956,6 +962,7 @@ class PocketTtsProvider {
                     }
                 }
                 this._updateStatus(this.ready);
+                this._flushSendQueue();
                 return;
             }
             if (msg.status === 'error') {
@@ -997,6 +1004,7 @@ class PocketTtsProvider {
                     console.log('[pocketTTS-WS] worker error:', error || msg?.error);
                 }
                 this._updateStatus(this.ready);
+                this._flushSendQueue();
                 return;
             }
             if (msg.status === 'session_ended') {
