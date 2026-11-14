@@ -1,23 +1,46 @@
-/** Seconds of queued audio needed before starting or recovering playback. */
+
 export class AdaptiveBuffer {
-    target = 0.06;
+    target = 2;
+
+    minTarget = 1;
+    maxTarget = 5;
+
     underruns = 0;
-    lastArrival;
-    previousDuration = 0;
-    jitter = 0;
-    arrive(now, duration) {
-        if (this.lastArrival !== undefined) {
-            const gap = Math.max(0, now - this.lastArrival - this.previousDuration);
-            this.jitter = 0.2 * gap + 0.8 * this.jitter;
-            this.target = Math.max(0.06, Math.min(0.6, this.target * 0.98));
-            this.target = Math.max(this.target, Math.min(0.6, this.jitter * 2 + 0.04));
+    stableChunks = 0;
+
+    // Call when audio arrives.
+    arrive() {
+        this.stableChunks++;
+
+        // Gradually reduce buffering after stable arrivals.
+        if (this.stableChunks >= 5) {
+            this.target = Math.max(
+                this.minTarget,
+                this.target - 0.015
+            );
+
+            this.stableChunks = 0;
         }
-        this.lastArrival = now;
-        this.previousDuration = duration;
     }
+
+    // Call ONLY when playback actually runs out of audio.
     underrun() {
         this.underruns++;
-        this.target = Math.min(0.6, Math.max(this.target * 1.5, this.target + 0.04));
+        this.stableChunks = 0;
+
+        this.target = Math.min(
+            this.maxTarget,
+            this.target + 0.1
+        );
+    }
+
+    startupThreshold() {
+        return 0.1;
+    }
+
+    reset() {
+        this.target = 0.2;
+        this.underruns = 0;
+        this.stableChunks = 0;
     }
 }
-//# sourceMappingURL=adaptive-buffer.js.map
