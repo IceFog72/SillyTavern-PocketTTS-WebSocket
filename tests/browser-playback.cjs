@@ -141,6 +141,10 @@ const server = createServer((req, res) => {
     while(queue.adp.tracks.length && performance.now()<deadline) await new Promise(r=>setTimeout(r,20));
     if(played.length!==3 || queue.adp.tracks.length || queue.adp.isPlaying) throw Error(`Playlist stalled: played=${played.length}, remaining=${queue.adp.tracks.length}`);
     if(played.some(stream=>!stream.started || !stream.stopped)) throw Error('A sentence was skipped or not drained');
+    for (let i = 1; i < played.length; i++) {
+     const gap = played[i].anchorTime - played[i - 1].nextTime;
+     if (Math.abs(gap) > 0.002) throw Error(`Ready PCM sentence handoff was ${Math.round(gap * 1000)} ms`);
+    }
     await window.context.close();
     return {requests:requests.length,played:played.length,remaining:queue.adp.tracks.length};
    });
@@ -275,30 +279,36 @@ const server = createServer((req, res) => {
     queue.adp.playingIdx=-1;
     queue.playNextInQueue();
     await new Promise(r=>setTimeout(r,120));
+    const isScheduledAtHandoff = () => streams[1].sources.size > 0 && streams[1].anchorTime === streams[0].nextTime;
+    if(!isScheduledAtHandoff()) throw Error('Ready next sentence was not scheduled');
     document.getElementById('ptts-play').click();
-    if(streams[0].playing) throw Error('Pause does not pause PCM');
+    if(streams[0].playing || streams[1].playing || streams[1].sources.size) throw Error('Pause left PCM scheduled');
     const player=window._pttsGetPlayback();
     const pausedAt=player.currentTime;
     await new Promise(r=>setTimeout(r,180));
     if(Math.abs(player.currentTime-pausedAt)>0.01 || !queue.adp.isPlaying) throw Error('Paused clock advanced or playlist skipped');
     document.getElementById('ptts-play').click();
-    if(!streams[0].playing) throw Error('Resume does not resume PCM');
+    if(!streams[0].playing || !isScheduledAtHandoff()) throw Error('Resume did not restore the PCM handoff');
     const volume=document.getElementById('ptts-volume');
     volume.value='25';volume.dispatchEvent(new Event('input'));
-    if(streams[0].output.gain.value!==0.25) throw Error('Volume did not reach PCM output');
+    if(streams[0].output.gain.value!==0.25 || streams[1].output.gain.value!==0.25) throw Error('Volume did not reach PCM output');
     document.getElementById('ptts-vol-btn').click();
     if(streams[0].output.gain.value!==0) throw Error('Mute failed');
     document.getElementById('ptts-vol-btn').click();
     if(streams[0].output.gain.value!==0.25) throw Error('Unmute failed');
     document.getElementById('ptts-speed').click();
     if(streams[0].playbackRate!==1.1 || [...streams[0].sources].some(source=>Math.abs(source.playbackRate.value-1.1)>0.000001)) throw Error('Speed did not reach scheduled PCM');
+    if(streams[1].playbackRate!==1.1 || !isScheduledAtHandoff()) throw Error('Rate change did not reschedule the next sentence');
     const seek=document.getElementById('ptts-seeker');
     seek.value='1.2';seek.dispatchEvent(new Event('input'));seek.dispatchEvent(new Event('change'));
     if(Math.abs(player.currentTime-1.2)>0.05) throw Error('Seek failed');
+    if(!isScheduledAtHandoff()) throw Error('Seek did not reschedule the next sentence');
     await new Promise(r=>setTimeout(r,220));
     if(!document.getElementById('ptts-play').querySelector('i').classList.contains('fa-pause') || Number(seek.max)!==2) throw Error('Playback display is stale');
+    const plannedHandoff = streams[0].nextTime;
     document.getElementById('ptts-skip').click();
     if(!streams[0].stopped || !streams[1].playing || Math.abs(streams[1].playbackRate-1.1)>0.000001 || streams[1].output.gain.value!==0.25) throw Error('Skip or next-track settings failed: '+JSON.stringify(streams.map(stream=>({stopped:stream.stopped,playing:stream.playing,rate:stream.playbackRate,volume:stream.output.gain.value}))));
+    if(streams[1].anchorTime >= plannedHandoff) throw Error('Skip left the next sentence scheduled at the old boundary');
     const stAudio=new Audio(URL.createObjectURL(new Blob([wav],{type:'audio/wav'})));
     stAudio.id='tts_audio';document.body.append(stAudio);
     // Switch providers while a Pocket sentence is still active. Late Pocket

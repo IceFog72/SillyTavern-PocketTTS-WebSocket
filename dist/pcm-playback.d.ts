@@ -7,6 +7,6 @@ export declare function pcmDuration(stream: PcmAudioStream): number;
 export declare function pcmPosition(stream: PcmAudioStream): number;
 export declare function seekPcm(stream: PcmAudioStream, seconds: number): void;
 export declare function pausePcm(stream: PcmAudioStream): void;
-export declare function resumePcm(stream: PcmAudioStream): void;
+export declare function resumePcm(stream: PcmAudioStream, startAt?: number): void;
 export declare function setPcmRate(stream: PcmAudioStream, rate: number): void;
 export declare function setPcmVolume(stream: PcmAudioStream, volume: number): void;

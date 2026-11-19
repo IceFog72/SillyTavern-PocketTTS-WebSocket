@@ -112,7 +112,7 @@ export interface PcmAudioStream {
     resumeFade: boolean;
     queue: Uint8Array[];
     scheduledChunks: number;
-    endTimer?: ReturnType<typeof setTimeout>;
+    onEndScheduled?: () => void;
     onEnded?: () => void;
 }
 

@@ -43,7 +43,6 @@ export function stopPcm(stream: PcmAudioStream) {
 
 export function pumpPcm(stream: PcmAudioStream) {
     if (!stream.playing || stream.stopped) return;
-    clearTimeout(stream.endTimer);
     if (stream.context.state === 'suspended') void stream.context.resume();
     const now = stream.context.currentTime;
     if (stream.started && stream.nextTime <= now && !stream.rebuffering && !stream.closed) {
@@ -81,16 +80,28 @@ export function pumpPcm(stream: PcmAudioStream) {
             stream.resumeFade = false;
         }
         stream.sources.add(source);
-        source.onended = () => { stream.sources.delete(source); source.disconnect(); gain.disconnect(); };
+        source.onended = () => {
+            const scheduled = stream.sources.delete(source);
+            source.disconnect();
+            gain.disconnect();
+            if (scheduled) finishPcmIfDrained(stream);
+        };
         source.start(stream.nextTime);
         stream.nextTime += buffer.duration / stream.playbackRate;
         stream.scheduledChunks++;
         stream.started = true;
     }
-    if (stream.closed && stream.onEnded) {
-        const delay = Math.max(0, stream.nextTime - stream.context.currentTime) * 1000 + 20;
-        stream.endTimer = setTimeout(() => { if (!stream.stopped && stream.playing) stream.onEnded?.(); }, delay);
+    if (stream.closed) {
+        stream.onEndScheduled?.();
+        finishPcmIfDrained(stream);
     }
+}
+
+function finishPcmIfDrained(stream: PcmAudioStream) {
+    if (!stream.closed || !stream.playing || stream.stopped || stream.sources.size || stream.queue.length) return;
+    const onEnded = stream.onEnded;
+    stream.onEnded = undefined;
+    onEnded?.();
 }
 
 export function pcmDuration(stream: PcmAudioStream) {
@@ -103,7 +114,6 @@ export function pcmPosition(stream: PcmAudioStream) {
 }
 
 function cancelSources(stream: PcmAudioStream) {
-    clearTimeout(stream.endTimer);
     for (const source of stream.sources) { try { source.stop(); } catch {} }
     stream.sources.clear();
 }
@@ -134,7 +144,8 @@ export function pausePcm(stream: PcmAudioStream) {
     seekPcm(stream, position);
 }
 
-export function resumePcm(stream: PcmAudioStream) {
+export function resumePcm(stream: PcmAudioStream, startAt?: number) {
+    if (startAt !== undefined) stream.nextTime = startAt;
     stream.playing = true;
     pumpPcm(stream);
 }

@@ -40,7 +40,6 @@ export function stopPcm(stream) {
 export function pumpPcm(stream) {
     if (!stream.playing || stream.stopped)
         return;
-    clearTimeout(stream.endTimer);
     if (stream.context.state === 'suspended')
         void stream.context.resume();
     const now = stream.context.currentTime;
@@ -81,17 +80,29 @@ export function pumpPcm(stream) {
             stream.resumeFade = false;
         }
         stream.sources.add(source);
-        source.onended = () => { stream.sources.delete(source); source.disconnect(); gain.disconnect(); };
+        source.onended = () => {
+            const scheduled = stream.sources.delete(source);
+            source.disconnect();
+            gain.disconnect();
+            if (scheduled)
+                finishPcmIfDrained(stream);
+        };
         source.start(stream.nextTime);
         stream.nextTime += buffer.duration / stream.playbackRate;
         stream.scheduledChunks++;
         stream.started = true;
     }
-    if (stream.closed && stream.onEnded) {
-        const delay = Math.max(0, stream.nextTime - stream.context.currentTime) * 1000 + 20;
-        stream.endTimer = setTimeout(() => { if (!stream.stopped && stream.playing)
-            stream.onEnded?.(); }, delay);
+    if (stream.closed) {
+        stream.onEndScheduled?.();
+        finishPcmIfDrained(stream);
     }
+}
+function finishPcmIfDrained(stream) {
+    if (!stream.closed || !stream.playing || stream.stopped || stream.sources.size || stream.queue.length)
+        return;
+    const onEnded = stream.onEnded;
+    stream.onEnded = undefined;
+    onEnded?.();
 }
 export function pcmDuration(stream) {
     return stream.totalSamples / stream.sampleRate;
@@ -101,7 +112,6 @@ export function pcmPosition(stream) {
     return Math.min(pcmDuration(stream), stream.position + elapsed);
 }
 function cancelSources(stream) {
-    clearTimeout(stream.endTimer);
     for (const source of stream.sources) {
         try {
             source.stop();
@@ -138,7 +148,9 @@ export function pausePcm(stream) {
     stream.playing = false;
     seekPcm(stream, position);
 }
-export function resumePcm(stream) {
+export function resumePcm(stream, startAt) {
+    if (startAt !== undefined)
+        stream.nextTime = startAt;
     stream.playing = true;
     pumpPcm(stream);
 }

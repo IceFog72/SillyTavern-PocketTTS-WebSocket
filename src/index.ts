@@ -29,6 +29,7 @@ import { extension_settings } from '../../../../extensions.js';
 import { PocketTtsProvider } from './pocket-tts.js';
 import { initTtsBar } from './tts-bar.js';
 import { pcmPosition, pcmDuration, pausePcm, resumePcm, seekPcm, setPcmRate, setPcmVolume } from './pcm-playback.js';
+import type { PcmAudioStream } from './types.js';
 
 // All console output prefixed [pocketTTS-WS] for easy filtering in devtools
 const log = (...args) => console.log('[pocketTTS-WS]', ...args);
@@ -214,14 +215,36 @@ function activePcmStream() {
 const pcmPlayback = {
     get paused() { return !activePcmStream()?.playing; },
     get currentTime() { const stream = activePcmStream(); return stream ? pcmPosition(stream) : 0; },
-    set currentTime(value) { const stream = activePcmStream(); if (stream) seekPcm(stream, value); },
+    set currentTime(value) {
+        const stream = activePcmStream();
+        if (!stream || !Number.isFinite(value)) return;
+        cancelPcmHandoff();
+        seekPcm(stream, value);
+    },
     get duration() { const stream = activePcmStream(); return stream ? pcmDuration(stream) : 0; },
     get volume() { return activePcmStream()?.output.gain.value ?? pttsAudio.volume; },
-    set volume(value) { pttsAudio.volume = value; const stream = activePcmStream(); if (stream) setPcmVolume(stream, value); },
+    set volume(value) {
+        pttsAudio.volume = value;
+        const stream = activePcmStream();
+        if (stream) setPcmVolume(stream, value);
+        if (scheduledNextPcm) setPcmVolume(scheduledNextPcm, value);
+    },
     get playbackRate() { return activePcmStream()?.playbackRate ?? pttsAudio.playbackRate; },
-    set playbackRate(value) { pttsAudio.defaultPlaybackRate = value; pttsAudio.playbackRate = value; const stream = activePcmStream(); if (stream) setPcmRate(stream, value); },
+    set playbackRate(value) {
+        pttsAudio.defaultPlaybackRate = value;
+        pttsAudio.playbackRate = value;
+        const stream = activePcmStream();
+        if (!stream || stream.playbackRate === value || !Number.isFinite(value) || value <= 0) return;
+        cancelPcmHandoff();
+        setPcmRate(stream, value);
+    },
     play() { const stream = activePcmStream(); if (stream) resumePcm(stream); return Promise.resolve(); },
-    pause() { const stream = activePcmStream(); if (stream) pausePcm(stream); },
+    pause() {
+        const stream = activePcmStream();
+        if (!stream) return;
+        cancelPcmHandoff();
+        pausePcm(stream);
+    },
     get _savedVol() { return pttsAudio._savedVol; },
     set _savedVol(value) { pttsAudio._savedVol = value; },
 };
@@ -241,9 +264,37 @@ function scheduleUiTask(fn, label) {
 // ─── Per-Message Playlist Playback ─────────────────────────────────
 
 let activeTrackCleanup = null;
+let scheduledNextPcm: PcmAudioStream | null = null;
+
+function schedulePcmHandoff() {
+    const current = activePcmStream();
+    if (scheduledNextPcm || !current?.closed || !current.playing || !current.started
+        || current.context.state === 'closed' || current.nextTime <= current.context.currentTime) return;
+    const next = adp.tracks.find((item, index) => index > adp.playingIdx && !item.error);
+    const stream: PcmAudioStream | undefined = next?.audioStream;
+    if (!stream || next.pending || stream.stopped || stream.context !== current.context) return;
+
+    // Keep the active track selected until it drains. The audio clock can
+    // start its successor at the boundary even if the UI thread is busy.
+    setPcmVolume(stream, current.output.gain.value);
+    setPcmRate(stream, current.playbackRate);
+    scheduledNextPcm = stream;
+    resumePcm(stream, current.nextTime);
+}
+
+function cancelPcmHandoff() {
+    if (!scheduledNextPcm) return;
+    const stream = scheduledNextPcm;
+    scheduledNextPcm = null;
+    stream.playing = false;
+    seekPcm(stream, 0);
+}
 
 function playNextInQueue() {
-    if (adp.isPlaying) return;
+    if (adp.isPlaying) {
+        schedulePcmHandoff();
+        return;
+    }
 
     // Skip past error tracks, find first playable
     while (adp.playingIdx + 1 < adp.tracks.length) {
@@ -308,6 +359,8 @@ function playNextInQueue() {
         };
         activeTrackCleanup = cleanup;
         item.audioStream.onEnded = cleanup;
+        item.audioStream.onEndScheduled = schedulePcmHandoff;
+        if (scheduledNextPcm === item.audioStream) scheduledNextPcm = null;
         const savedVolume = localStorage.getItem('ptts-bar-volume');
         const savedRate = localStorage.getItem('ptts-bar-speed');
         setPcmVolume(item.audioStream, savedVolume === null ? pttsAudio.volume : Number(savedVolume));
@@ -364,6 +417,7 @@ function removePlayedMsgTracks(msgId, playedTrackId) {
 function skipTrack() {
     if (!adp.isPlaying || !activeTrackCleanup) return;
     log('skip');
+    cancelPcmHandoff();
     pttsAudio.pause();
     const cleanup = activeTrackCleanup;
     cleanup();
@@ -374,6 +428,7 @@ function nukePlaylist() {
     log(`nuke (${count} tracks, playing=${adp.isPlaying})`);
 
     window._pttsProvider?.resetSession('playlist nuked');
+    scheduledNextPcm = null;
 
     // Revoke all blob URLs
     for (const t of adp.tracks) {
@@ -402,6 +457,10 @@ function nukePlaylist() {
 function nukeMsgTracks(msgId) {
     const removed = adp.tracks.filter(t => t.msgId === msgId);
     const remaining = adp.tracks.filter(t => t.msgId !== msgId);
+    const current = activePcmStream();
+    if (removed.some(t => t.audioStream && (t.audioStream === current || t.audioStream === scheduledNextPcm))) {
+        cancelPcmHandoff();
+    }
 
     // Revoke blob URLs for removed tracks
     for (const t of removed) {
@@ -440,7 +499,7 @@ function nukeMsgTracks(msgId) {
     adp.tracks = remaining;
     log(`nuke msg=${msgId}: removed ${removed.length}, ${remaining.length} remain`);
     refreshPlaylistUi();
-    if (!adp.isPlaying) playNextInQueue();
+    playNextInQueue();
 }
 
 function refreshPlaylistUi() {
