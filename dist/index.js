@@ -834,6 +834,12 @@ function narrateCurrentLastMessageAfterSwipe() {
         return;
     const provider = window._pttsProvider;
     provider?.resetSession('message swipe');
+    // New swipe slot: mes still holds the previous swipe until the reply arrives.
+    // GENERATION_STARTED + onTick narrate the new text instead.
+    if (isPendingSwipe(message)) {
+        log(`swipe msg=${msgId} awaits generation`);
+        return;
+    }
     log(`swipe narrate msg=${msgId}`);
     adp.active = true;
     adp.isUserMsg = !!message.is_user;
@@ -848,6 +854,11 @@ function narrateCurrentLastMessageAfterSwipe() {
     flushBuffer();
     provider?.sendTextDone();
     adp.active = false;
+}
+// ST sets swipe_id = swipes.length before generating a new swipe, and only grows
+// swipes (then sets mes) in saveReply. Until then, mes is the previous swipe's text.
+function isPendingSwipe(message) {
+    return Array.isArray(message.swipes) && message.swipe_id >= message.swipes.length;
 }
 function onTick() {
     if (!adp.active)
@@ -864,7 +875,7 @@ function onTick() {
         logDebug(`[tts] skip user msg: narrate_user=${extension_settings.tts.narrate_user}`);
         return;
     }
-    if (lastMsg.mes == null)
+    if (lastMsg.mes == null || isPendingSwipe(lastMsg))
         return;
     adp.isUserMsg = !!lastMsg.is_user;
     adp.msgCharName = lastMsg.name || (lastMsg.is_user ? context.name1 : context.name2);
