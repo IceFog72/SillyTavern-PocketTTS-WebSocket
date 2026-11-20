@@ -47,7 +47,7 @@ Single persistent connection to `/v1/audio/stream`. Requests are fire-and-forget
 | Model | `english-cpu` | Dynamically populated from server (e.g., `english-cpu`, `french_24l-gpu`) |
 | Audio Format | `mp3` | mp3, wav, opus, flac, aac |
 | Speed | `1.0` | 0.5–2.0 |
-| Temperature | `1.0` | 0.0–2.0 |
+| Temperature | `0.3` | 0.0–2.0 |
 
 Voice mapping: SillyTavern's TTS Voice Map section.
 
@@ -58,9 +58,11 @@ With SillyTavern's **Only narrate "quotes"** option enabled, only quoted text is
 The extension keeps at most 4 phrases in flight on the socket. A long message narrated at once stays within the server's per-socket queue and rate limit.
 
 ### GPU VRAM Overhead (CUDA Context)
+The `-gpu` model variants run on NVIDIA GPUs and, with a ROCm build of PyTorch on Linux, on AMD GPUs. ROCm builds expose the GPU through the same `cuda` device, so the extension needs no extra setting. Choose the backend when running the server's installer.
+
 When using a `-gpu` model variant, you may notice a lingering ~170 MB of VRAM usage even after TTS generation finishes and you switch back to a `-cpu` model. **This is not a memory leak.**
 
-Whenever a PyTorch application initializes the GPU for the first time, the NVIDIA driver creates a "CUDA context" for that Python process. This context loads essential GPU libraries (like cuBLAS/cuDNN handles) and driver state into VRAM. Depending on your driver version and GPU architecture, this base footprint is typically between 150 MB and 300 MB.
+Whenever a PyTorch application initializes the GPU for the first time, the GPU driver creates a device context (a "CUDA context", or its HIP equivalent on ROCm) for that Python process. This context loads essential GPU libraries (like cuBLAS/cuDNN, or rocBLAS/MIOpen on ROCm) and driver state into VRAM. Depending on your driver version and GPU architecture, this base footprint is typically between 150 MB and 300 MB.
 
 This overhead is a hard architectural limitation of PyTorch and CUDA. Once a Python process creates a CUDA context, that memory is locked to the process until the backend server itself is shut down. However, the heavy components (the 1GB+ TTS model weights) are successfully freed when switching to a `-cpu` model in the extension UI, leaving the vast majority of your VRAM completely free for your LLMs and other tasks.
 
